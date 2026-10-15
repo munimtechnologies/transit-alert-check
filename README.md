@@ -11,8 +11,8 @@ its static GTFS schedule, and reports for every alert:
   escalators), routes that stop there on the alert's dates but are not tagged.
 - **Routes that do not stop there:** tagged route/stop pairs where the route does not stop at that stop on the
   alert's dates, or nowhere in the schedule.
-- **Text and tags that disagree:** route numbers named in the text but not tagged, and stop numbers in the
-  header that are not tagged.
+- **Text and tags that disagree:** route numbers named in the text but not tagged; tagged routes that the text
+  leaves out when it lists the affected routes (new in 0.2.0); stop numbers in the header that are not tagged.
 - **IDs that are not in the schedule:** tagged route and stop IDs, and stop numbers in the text.
 - **Timing and accessibility:** open-ended alerts, alerts that ended but are still in the feed, header length,
   translations and text-to-speech text.
@@ -28,6 +28,14 @@ Defaults point at King County Metro's public feeds
 GTFS and GTFS-realtime alerts as JSON works the same way. It was built as an open prototype for King
 County Metro's "SMART-alerts" use case in the Exchange Northwest Civic Innovation Challenge (round 2,
 2026). It is not an official King County tool.
+
+## Results so far
+
+- [reports/2026-10-15/hand-check.md](reports/2026-10-15/hand-check.md): a manual check of 10 of Metro's live
+  stop alerts against the routes OneBusAway lists at each stop. Tagging was complete at all 9 stops that are
+  still in the schedule. One alert lists only one of the four routes it is tagged with in its text, which is
+  why 0.2.0 checks for that. One closed stop has been taken out of the schedule.
+- The first full run on the whole feed is queued. Its report will be added here after it has been checked by hand.
 
 ## Use
 
@@ -56,8 +64,12 @@ they fall on the same day across U.S. time zones.
   route and direction. A route "stops at" a stop on a day when one of its trips that day stops there.
 - Each alert is checked against the first 14 days of its active period, or against the days it ran if it has
   ended. Calendar exceptions (holidays) count.
-- A station tagged as a stop covers its platforms.
+- A station tagged as a stop covers its platforms. Because a station alert (an escalator, a stairway) may not
+  affect every route that uses the station, the summary also counts alerts at plain stops on their own.
 - Tags of other agencies in the same feed are skipped.
+- A tagged route counts as left out of the text only when the text lists routes ("Affected routes: ...") and
+  the route's name appears nowhere in the header or description, as a whole word and not inside a stop number.
+  So "DART 914" or "ST 522" written another way still counts as named.
 
 ## Limits
 
@@ -68,10 +80,17 @@ they fall on the same day across U.S. time zones.
 - A detour of one route is not checked for missing routes, because the other routes still serve those stops.
 - Drafts are for staff review. The tool knows the schedule, not conditions on the street.
 
+## Changes
+
+- 0.2.0: new check for tagged routes that the alert text leaves out; separate counts for alerts at plain stops
+  and at stations; clearer wording when a tagged stop is not in the schedule; first hand-check report.
+- 0.1.0: first release.
+
 ## License and credits
 
-Code: Apache-2.0 (see `LICENSE`). Reports the tool writes: CC BY 4.0. Schedule and alert data belong to the
-agencies that publish them and are used under their terms. This repository does not redistribute them.
+Code: Apache-2.0 (see `LICENSE`). Reports in `reports/`: CC BY 4.0; they quote alert headers for reference.
+Schedule and alert data belong to the agencies that publish them and are used under their terms. This
+repository does not redistribute the feeds.
 
 Made by MV2 of Munim, Inc. (munimversion2@gmail.com). The code and this README were made with AI agents
 working in MV2's name.

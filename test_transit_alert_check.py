@@ -192,6 +192,14 @@ class TextTest(unittest.TestCase):
         self.assertEqual(tac.route_names_in("Routes 5, 21/E Line"), {"5", "21", "E LINE"})
         self.assertEqual(tac.route_names_in("Buses are rerouted"), set())
 
+    def test_mentions_route(self):
+        self.assertTrue(tac.mentions_route("Affected routes:\r\n70\r\nGet on/off at:", "70"))
+        self.assertFalse(tac.mentions_route("Stop #9670 NE 125th St closed. Affected routes:\r\n65", "70"))
+        self.assertFalse(tac.mentions_route("Stop #10240 Boren Ave", "10"))
+        self.assertTrue(tac.mentions_route("Affected routes:\r\n164\r\nDART 914", "914"))
+        self.assertTrue(tac.mentions_route("For Rapidride e line riders", "E Line"))
+        self.assertFalse(tac.mentions_route("Route 2550 closed", "255"))
+
     def test_stop_numbers(self):
         self.assertEqual(tac.STOP_NUMBER_RE.findall("Stop #70666 NE 85th St & Kirkland Way (EB) closed"), ["70666"])
         self.assertEqual(tac.STOP_NUMBER_RE.findall("use stop #47270 or a temporary stop"), ["47270"])
@@ -271,6 +279,7 @@ class AuditTest(Fixture):
                                        "route_not_serving_stop": 2, "unknown_route": 1, "unknown_stop": 1,
                                        "unknown_stop_in_text": 1})
         self.assertEqual((s["stop_level"], s["stop_level_missing_routes"]), (4, 4))
+        self.assertEqual((s["stop_level_plain"], s["stop_level_plain_missing_routes"]), (3, 3))
         self.assertEqual(s["replay"], {"alert_pairs": 3, "drafted_pairs": 7, "matched": 2, "missing_routes": 5,
                                        "human_alternates": 2, "alternates_found": 2})
         self.assertEqual((s["expired"], s["open_ended"], s["future"]), (1, 1, 2))
@@ -292,6 +301,8 @@ class AuditTest(Fixture):
         self.assertEqual(self.by_id["E5"]["issues"], [
             {"kind": "route_missing_at_stop", "stop_id": "9000", "stop": "#9000 Central Station", "routes": ["30"]}])
         self.assertEqual(self.by_id["E5"]["languages"], ["en", "es"])
+        self.assertTrue(self.by_id["E5"]["at_station"])
+        self.assertFalse(self.by_id["E1"]["at_station"])
         self.assertEqual(self.kinds("E6"), [])
         self.assertEqual(self.by_id["E6"]["routes"], ["30"])
         self.assertEqual(self.by_id["E7"]["issues"][0]["when"], "off_dates")
@@ -304,11 +315,42 @@ class AuditTest(Fixture):
         self.assertIn("| Tagged route ID not in the schedule | 1 | 1 |", md)
         self.assertIn("- Stop #1002 1st Ave & Pike St: route 20 also stops here on these dates but is not tagged", md)
         self.assertIn("- Route 30 is tagged at stop #1003 1st Ave & Union St but does not stop there on these dates", md)
+        self.assertIn("- Alerts whose text lists routes but leaves out a tagged one: 0", md)
+        self.assertIn("- Of these, at a plain stop rather than a station or its platforms: 3; missing at least "
+                      "one route: 3", md)
         self.assertIn("with AI agents", md)
         rp = tac.replay_markdown(self.result)
         self.assertIn("## Alert E1 (NO_SERVICE / STOP_CLOSURE)", rp)
         self.assertIn("Routes tagged by staff: 10. Routes the schedule shows at these stops: 10, 20.", rp)
         self.assertNotIn("Alert E2", rp)
+
+
+class TaggedNotNamedTest(Fixture):
+    """The pattern seen in a live King County Metro alert on 2026-10-15: a stop move
+    tagged with every route that stops there, whose text lists only one of them."""
+
+    def check(self, header, desc, entities):
+        e = alert("N1", "STOP_MOVED", "", header, desc, entities, FEED, ts(2026, 12, 31))
+        return tac.check_alert(self.g, e, FEED)
+
+    def test_text_lists_fewer_routes_than_tagged(self):
+        r = self.check("Stop #1002 1st Ave & Pike St relocated due to construction.",
+                       "Affected routes:\r\n10\r\nGet on/off at:\r\nStop #1001 1st Ave & Pine St",
+                       [ie("R10", "1002"), ie("R20", "1002")])
+        self.assertEqual(r["issues"], [{"kind": "tagged_not_named", "route": "20"}])
+        self.assertEqual(tac.issue_text(r["issues"][0]),
+                         "Route 20 is tagged, but the text lists other routes and never names it")
+
+    def test_route_written_another_way_is_not_flagged(self):
+        r = self.check("Stop #1002 1st Ave & Pike St relocated.",
+                       "Affected routes:\r\n10\r\nDART 20\r\nGet on/off at:\r\nStop #1001",
+                       [ie("R10", "1002"), ie("R20", "1002")])
+        self.assertEqual(r["issues"], [])
+
+    def test_text_without_a_route_list_is_not_flagged(self):
+        r = self.check("Stop #1002 1st Ave & Pike St relocated.", "Use the temporary stop just north.",
+                       [ie("R10", "1002"), ie("R20", "1002")])
+        self.assertEqual(r["issues"], [])
 
 
 class CommandTest(Fixture):

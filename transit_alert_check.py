@@ -11,7 +11,9 @@ its static GTFS, and lists, for every alert:
 - for stop closures, stop moves and accessibility alerts, routes that do stop
   there on those dates but are not tagged (their riders may not see the alert);
 - route numbers named in the text but not tagged, and stop numbers in the text
-  that are not tagged or not in the schedule.
+  that are not tagged or not in the schedule;
+- tagged routes that the text leaves out when it lists the affected routes
+  (their riders see the alert, but it reads as if their route is not affected).
 
 The drafter works the other way: given the stops that close and the dates, it
 finds every route and direction that serves them, the nearest open stop before
@@ -37,7 +39,7 @@ import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 REPO_URL = "https://github.com/munimtechnologies/transit-alert-check"
 USER_AGENT = "transit-alert-check/%s (+%s)" % (__version__, REPO_URL)
@@ -72,6 +74,7 @@ KIND_TEXT = {
     "route_missing_at_stop": "Routes that stop here on the alert's dates but are not tagged",
     "route_not_serving_stop": "Tagged route does not stop here on the alert's dates in the schedule",
     "named_not_tagged": "Route named in the alert text but not tagged",
+    "tagged_not_named": "Tagged route left out of the routes the text lists",
     "header_stop_not_tagged": "Stop number in the header but not tagged",
     "unknown_stop": "Tagged stop ID not in the schedule",
     "unknown_route": "Tagged route ID not in the schedule",
@@ -354,6 +357,12 @@ def route_names_in(text):
     return out
 
 
+def mentions_route(text, name):
+    """True when a route name appears anywhere in the text as a whole word, not as part
+    of a stop number ('#9670' does not mention route 70; 'DART 914' mentions 914)."""
+    return bool(re.search(r"(?<![\w#])%s(?!\w)" % re.escape(name), text or "", re.I))
+
+
 def is_stop_level(effect, detail):
     return effect in STOP_LEVEL_EFFECTS or (effect != "DETOUR" and bool(STOP_LEVEL_DETAIL_RE.search(detail or "")))
 
@@ -426,9 +435,16 @@ def check_alert(g, entity, feed_ts, tz=None):
     routes_tagged = {r for r, _, _ in pairs} | route_level
     names_tagged = {g.route_name(r).upper() for r in routes_tagged}
     gtfs_names = g.route_names()
-    for name in sorted(route_names_in(header + "\n" + desc), key=route_sort_key):
+    text = header + "\n" + desc
+    named = route_names_in(text)
+    for name in sorted(named, key=route_sort_key):
         if name in gtfs_names and name not in names_tagged:
             issues.append({"kind": "named_not_tagged", "route": name})
+    # Only when the text lists routes: a tagged route it never mentions reads as unaffected.
+    if named:
+        for name in sorted({g.route_name(r) for r in routes_tagged}, key=route_sort_key):
+            if not mentions_route(text, name):
+                issues.append({"kind": "tagged_not_named", "route": name})
 
     header_nums = STOP_NUMBER_RE.findall(header)
     all_nums = header_nums + STOP_NUMBER_RE.findall(desc)
@@ -476,6 +492,8 @@ def check_alert(g, entity, feed_ts, tz=None):
         "scheduled_services": len(services),
         "routes": sorted({g.route_name(r) for r in routes_tagged}, key=route_sort_key),
         "stops": sorted(tagged),
+        # A station or one of its platforms: other routes there may use another part of the station.
+        "at_station": any(g.children.get(s) or g.stops[s]["parent"] for s in tagged),
         "other_agency_entities": other_agency,
         "stop_level": stop_level,
         "expired": bool(end and end < feed_ts),
@@ -608,6 +626,9 @@ def audit(g, alerts, feed_ts, tz=None):
         "stop_level": len(stop_level),
         "stop_level_missing_routes": sum(1 for r in stop_level
                                          if any(i["kind"] == "route_missing_at_stop" for i in r["issues"])),
+        "stop_level_plain": sum(1 for r in stop_level if not r["at_station"]),
+        "stop_level_plain_missing_routes": sum(1 for r in stop_level if not r["at_station"] and any(
+            i["kind"] == "route_missing_at_stop" for i in r["issues"])),
         "replay": {k: sum(x[k] for x in replays) for k in ("alert_pairs", "drafted_pairs", "matched",
                                                           "missing_routes", "human_alternates",
                                                           "alternates_found")},
@@ -644,10 +665,13 @@ def issue_text(i):
             i["route"], i["stop"], "on these dates" if i["when"] == "off_dates" else "anywhere in the schedule")
     if k == "named_not_tagged":
         return "Route %s is named in the text but not tagged" % i["route"]
+    if k == "tagged_not_named":
+        return "Route %s is tagged, but the text lists other routes and never names it" % i["route"]
     if k == "header_stop_not_tagged":
         return "Stop %s is in the header but not tagged" % i["stop"]
     if k == "unknown_stop":
-        return "Tagged stop ID %s is not in the schedule" % i["stop_id"]
+        return ("Tagged stop ID %s is not in the schedule (it may have been taken out of the schedule "
+                "for the closure)" % i["stop_id"])
     if k == "unknown_route":
         return "Tagged route ID %s is not in the schedule" % i["route_id"]
     if k == "unknown_stop_in_text":
@@ -667,6 +691,10 @@ def report_markdown(result):
         "- Alerts: %d; with at least one finding: %d" % (s["alerts"], s["with_issue"]),
         "- Stop closures, stop moves and accessibility alerts: %d; of these, missing at least one route that "
         "stops there: %d" % (s["stop_level"], s["stop_level_missing_routes"]),
+        "- Of these, at a plain stop rather than a station or its platforms: %d; missing at least one route: %d"
+        % (s["stop_level_plain"], s["stop_level_plain_missing_routes"]),
+        "- Alerts whose text lists routes but leaves out a tagged one: %d"
+        % s["alerts_by_kind"].get("tagged_not_named", 0),
         "- Drafter replay on those alerts: it reproduced %d of the %d tagged route/stop pairs from the schedule "
         "and found %d more; it suggested %d of the %d other stops that staff named in the text"
         % (rp["matched"], rp["alert_pairs"], rp["missing_routes"], rp["alternates_found"], rp["human_alternates"]),
@@ -706,6 +734,8 @@ def report_markdown(result):
         "and routes missing from the alert cannot be found. Read the findings as questions for staff, not as errors.",
         "- Route numbers in the text can be alternatives (\"use route 255 instead\"), so a route named but not "
         "tagged needs a person to read the alert.",
+        "- A tagged route is reported as left out of the text only when the text lists routes and the route's "
+        "name appears nowhere in it.",
         "- Each alert is checked against the first %d days of its active period, or the days it ran if it has "
         "ended. Routes are matched to stops through the schedule's trips, not through maps." % WINDOW_DAYS,
         "- A detour of one route is not checked for missing routes, because other routes still serve those stops.",
