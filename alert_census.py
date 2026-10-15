@@ -7,7 +7,9 @@ The question: when an agency closes or moves a stop, which routes does the alert
 leave untagged, and are they the routes that run least often there? For every
 stop-level alert the census compares the trips a day of the routes staff tagged
 with the trips a day of the routes the schedule has at that stop but the alert
-leaves out, pooled over agencies and alert by alert (a sign test).
+leaves out, pooled over agencies and alert by alert (a sign test). It makes the
+same comparison counting only the trips made while each alert is active, leaving
+out routes that make no trip there in those hours (the alert may rightly omit them).
 
 Standard library only, Python 3.8+. Made by MV2 of Munim, Inc. with AI agents.
 Apache-2.0 license.
@@ -34,7 +36,8 @@ CLOSED_STATUSES = ("deprecated", "inactive")
 MAX_GTFS_MB = 150
 MAX_ALERTS_MB = 20
 FRESH_DAYS = 3  # a schedule downloaded by an earlier run is reused for this long
-PAIR_FIELDS = ("feed", "provider", "alert_id", "effect", "at_station", "stop_id", "route", "tagged", "trips_a_day")
+PAIR_FIELDS = ("feed", "provider", "alert_id", "effect", "at_station", "stop_id", "route", "tagged", "trips_a_day",
+               "trips_in_hours")
 
 
 def _ids(value):
@@ -114,11 +117,14 @@ def pair_rows(feed, result):
         base = {"feed": feed["id"], "provider": feed["provider"], "alert_id": r["id"], "effect": r["effect"],
                 "at_station": int(bool(r["at_station"]))}
         for p in r["replay"].get("tagged_pairs", []):
-            rows.append(dict(base, stop_id=p["stop_id"], route=p["route"], tagged=1, trips_a_day=p["trips_a_day"]))
+            rows.append(dict(base, stop_id=p["stop_id"], route=p["route"], tagged=1, trips_a_day=p["trips_a_day"],
+                             trips_in_hours=p.get("trips_in_hours")))
         for i in r["issues"]:
             if i["kind"] == "route_missing_at_stop":
-                for route, n in zip(i["routes"], i.get("trips_a_day", [])):
-                    rows.append(dict(base, stop_id=i["stop_id"], route=route, tagged=0, trips_a_day=n))
+                hours = i.get("trips_in_hours") or [None] * len(i["routes"])
+                for route, n, h in zip(i["routes"], i.get("trips_a_day", []), hours):
+                    rows.append(dict(base, stop_id=i["stop_id"], route=route, tagged=0, trips_a_day=n,
+                                     trips_in_hours=h))
     return rows
 
 
@@ -162,29 +168,32 @@ def sign_test(lower, higher):
     return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2.0 ** n)
 
 
-def _side(rows, tagged):
-    trips = [p["trips_a_day"] for p in rows if p["tagged"] == tagged]
+def _side(rows, tagged, key):
+    trips = [p[key] for p in rows if p["tagged"] == tagged]
     return {"pairs": len(trips), "median_trips": statistics.median(trips) if trips else None,
             "few_trips": sum(1 for n in trips if n <= tac.FEW_TRIPS)}
 
 
-def pooled(records):
-    """Tagged against missing route/stop pairs, over all agencies, at plain stops (not stations)."""
+def pooled(records, key="trips_a_day"):
+    """Tagged against missing route/stop pairs, over all agencies, at plain stops (not stations).
+    With key="trips_in_hours", pairs whose route makes no trip there while the alert is active are left out."""
     pairs = [p for rec in records for p in rec.get("pairs", []) if not p["at_station"]]
+    if key != "trips_a_day":
+        pairs = [p for p in pairs if p.get(key)]
     by_alert = {}
     for p in pairs:
         by_alert.setdefault((p["feed"], p["alert_id"]), []).append(p)
     lower = same = higher = 0
     for rows in by_alert.values():
-        tagged = [p["trips_a_day"] for p in rows if p["tagged"]]
-        missing = [p["trips_a_day"] for p in rows if not p["tagged"]]
+        tagged = [p[key] for p in rows if p["tagged"]]
+        missing = [p[key] for p in rows if not p["tagged"]]
         if not (tagged and missing):
             continue
         a, b = statistics.median(missing), statistics.median(tagged)
         lower += a < b
         same += a == b
         higher += a > b
-    return {"tagged": _side(pairs, 1), "missing": _side(pairs, 0),
+    return {"tagged": _side(pairs, 1, key), "missing": _side(pairs, 0, key),
             "alerts_with_both": lower + same + higher, "missing_runs_less": lower, "same": same,
             "missing_runs_more": higher, "sign_test_p": sign_test(lower, higher),
             "agencies_with_pairs": len({p["feed"] for p in pairs})}
@@ -194,9 +203,16 @@ def _cell(value):
     return "" if value is None else str(value)
 
 
+def _p(value):
+    return "n/a" if value is None else "%.3g" % value
+
+
 def census_markdown(records, skipped, when):
     ok = [r for r in records if r["status"] == "ok"]
     pool = pooled(records)
+    hours = pooled(records, "trips_in_hours")
+    idle = sum(1 for rec in records for p in rec.get("pairs", [])
+               if not p["at_station"] and not p["tagged"] and p.get("trips_in_hours") == 0)
     status = Counter(r["status"] for r in records)
     tot = Counter()
     for r in ok:
@@ -205,6 +221,7 @@ def census_markdown(records, skipped, when):
                   "stop_level_plain_missing_routes", "missing_route_pairs", "tagged_route_pairs"):
             tot[k] += s[k]
     t, m = pool["tagged"], pool["missing"]
+    ht, hm = hours["tagged"], hours["missing"]
     out = [
         "# Census: do transit alerts leave out the routes that run least often?",
         "",
@@ -233,8 +250,24 @@ def census_markdown(records, skipped, when):
         "Alert by alert, among the %d alerts at plain stops with both tagged and missing routes, the missing routes "
         "run fewer trips there (median against median) in %d, the same in %d and more in %d. Two-sided sign test, "
         "ties left out: p = %s." % (pool["alerts_with_both"], pool["missing_runs_less"], pool["same"],
-                                   pool["missing_runs_more"],
-                                   "n/a" if pool["sign_test_p"] is None else "%.3g" % pool["sign_test_p"]),
+                                   pool["missing_runs_more"], _p(pool["sign_test_p"])),
+        "",
+        "## Only the hours each alert is active",
+        "",
+        "A route that makes no trip at the stop while the alert is active may rightly be left out of it. Of the %d "
+        "untagged pairs at plain stops, %d make no trip there in the alert's hours. Leaving out every pair with no "
+        "trip in those hours, tagged or not, and counting only the trips made in them:" % (m["pairs"], idle),
+        "",
+        "| Route/stop pairs | Count | Median trips while active | At most %d trips |" % tac.FEW_TRIPS,
+        "|---|---:|---:|---:|",
+        "| Tagged by staff (and in the schedule) | %d | %s | %d |" % (ht["pairs"], _cell(ht["median_trips"]),
+                                                                    ht["few_trips"]),
+        "| In the schedule but not tagged | %d | %s | %d |" % (hm["pairs"], _cell(hm["median_trips"]),
+                                                             hm["few_trips"]),
+        "",
+        "Alert by alert, among the %d alerts with both, the missing routes run fewer trips in %d, the same in %d "
+        "and more in %d. Sign test: p = %s." % (hours["alerts_with_both"], hours["missing_runs_less"], hours["same"],
+                                                hours["missing_runs_more"], _p(hours["sign_test_p"])),
         "",
         "## By agency",
         "",
@@ -263,7 +296,9 @@ def census_markdown(records, skipped, when):
         "affect that route, or the schedule may already route it around the stop.",
         "- Stations are left out of the pair comparison, because an elevator or platform alert need not affect "
         "every route at the station.",
-        "- Trips a day count the whole day, not only the hours an alert is active.",
+        "- Trips a day count the whole day. Trips while active count only trips that reach the stop inside one of "
+        "the alert's periods; a blank stop time takes the time of the stop before, and a trip repeated through "
+        "frequencies.txt counts once in both.",
         "- The feed list comes from the Mobility Database catalog (MobilityData). Schedules are MobilityData's "
         "latest copy where it has one.",
         "",
@@ -278,6 +313,7 @@ def write_census(records, skipped, out_dir, when):
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "census.json"), "w", encoding="utf-8") as f:
         json.dump({"version": __version__, "run_utc": when, "skipped": dict(skipped), "pooled": pooled(records),
+                   "pooled_in_hours": pooled(records, "trips_in_hours"),
                    "feeds": [{k: v for k, v in r.items() if k != "pairs"} for r in records]},
                   f, indent=1, ensure_ascii=False)
     with open(os.path.join(out_dir, "census.md"), "w", encoding="utf-8") as f:

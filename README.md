@@ -9,8 +9,9 @@ JSON) and its static GTFS schedule, and reports for every alert:
 
 - **Routes missing at a closed stop:** for stop closures, stop moves and accessibility alerts (elevators,
   escalators), routes that stop there on the alert's dates but are not tagged, with the most trips each one
-  runs at that stop in a day. The same count is kept for the routes that are tagged, so the two can be
-  compared (new in 0.4.0).
+  makes at that stop in a day, and the most it makes there **while the alert is active** (new in 0.5.0). The
+  same counts are kept for the routes that are tagged, so the two can be compared. A route with no trip there
+  in the alert's hours may rightly be left out, and the summary counts those separately.
 - **Routes that do not stop there:** tagged route/stop pairs where the route does not stop at that stop on the
   alert's dates, or nowhere in the schedule.
 - **Text and tags that disagree:** route numbers named in the text but not tagged; tagged routes that the text
@@ -27,10 +28,12 @@ the live feed, using only the tagged stops and dates, and compares its draft wit
 **`check`** runs every check on one alert or draft and exits with code 1 if it finds anything, so it can sit
 in front of the publish button or in a script.
 
-The **census** (`alert_census.py`, new in 0.4.0) runs the audit on every GTFS-realtime alerts feed in the
+The **census** (`alert_census.py`) runs the audit on every GTFS-realtime alerts feed in the
 [Mobility Database](https://mobilitydatabase.org) catalog that needs no key and points to one schedule in the
 U.S. or Canada. It pools the route/stop pairs of every stop-level alert and asks whether the routes left out
-are the ones that run least often there: pair by pair, and alert by alert with a sign test.
+are the ones that run least often there: pair by pair, and alert by alert with a sign test. It asks the same
+question a second time counting only trips made while each alert is active, without the pairs whose route
+makes no trip there in those hours.
 
 Defaults point at King County Metro's public feeds
 ([GTFS](https://metro.kingcounty.gov/GTFS/google_transit.zip),
@@ -50,6 +53,9 @@ official King County or MBTA tool.
   at the stop on a day the alert is active: route 4 (9 trips that day) at a moved SL2 stop that has 126,
   route 83 (2 trips) at a stop with 94 trips of route 77, and route 116 (2 pre-dawn trips) at a closed stop.
   Every route left out runs only a few trips there.
+- [reports/2026-10-15/mbta-hours-check.md](reports/2026-10-15/mbta-hours-check.md): a route with no trip at
+  the stop while the alert is active may rightly be left out, so the three MBTA cases were checked against each
+  alert's own active period. All three hold: every trip of routes 4, 83 and 116 at those stops falls inside it.
 - The first full runs on King County Metro and the MBTA, and the first census of every keyless alerts feed
   in the U.S. and Canada, are queued. Their reports will be added here after they have been checked by hand.
 
@@ -69,8 +75,8 @@ python alert_census.py --data-dir data --out census
 
 - `audit.md`: the findings in plain language, alert by alert
 - `replay.md`: each drafted alert next to the one staff wrote
-- `findings.csv`: one row per finding, with `trips_a_day` for missing routes
-- `audit.json`: everything, including the per-alert replay counts and the tagged pairs with their trips a day
+- `findings.csv`: one row per finding, with `trips_a_day` and `trips_in_hours` for missing routes
+- `audit.json`: everything, including the per-alert replay counts and the tagged pairs with their trip counts
 
 `--alerts` takes the feed as protobuf (as most agencies publish it) or as JSON. Protobuf is decoded with the
 standard library from the field numbers in `gtfs-realtime.proto`; only the alert fields are read.
@@ -83,11 +89,11 @@ they fall on the same day across U.S. time zones. `--effect STOP_MOVED` writes "
 `draft --out`, prints each finding (or "No findings."), and exits 0 when there is nothing to report, 1 when
 there is, and 2 when the file holds no alert. `--now` sets the date to check from; `--json` prints everything.
 
-`alert_census.py` downloads the catalog, picks the feeds, and writes `census.md` (the pooled comparison and
-one row per agency), `census.json`, `pairs.csv` (one row per tagged or missing route/stop pair) and each
-agency's audit under `agencies/<feed id>/`. `--only` runs chosen feed IDs, `--countries` changes the
-countries, `--budget-minutes` stops starting new feeds after that long. A feed that cannot be read is listed
-with its error and the census goes on.
+`alert_census.py` downloads the catalog, picks the feeds, and writes `census.md` (the pooled comparisons and
+one row per agency), `census.json`, `pairs.csv` (one row per tagged or missing route/stop pair, with
+`trips_a_day` and `trips_in_hours`) and each agency's audit under `agencies/<feed id>/`. `--only` runs chosen
+feed IDs, `--countries` changes the countries, `--budget-minutes` stops starting new feeds after that long. A
+feed that cannot be read is listed with its error and the census goes on.
 
 ## How the checks work
 
@@ -100,6 +106,10 @@ with its error and the census goes on.
 - Trips a day: for each route at the stop, tagged or missing, the most trips it makes at that stop (or a
   station's platforms) on any one of those days, counting the whole day. The summary counts pairs with at
   most 4 trips a day on each side.
+- Trips while active (0.5.0): the same count, keeping only trips that reach the stop inside one of the alert's
+  periods. A stop time is placed on the calendar from the service day's noon minus 12 hours in the agency's
+  time zone, as GTFS defines it, so times past 24:00 fall on the next morning. A blank stop time (a stop
+  between timepoints) takes the time of the stop before; a trip with no times at all is counted.
 - A station tagged as a stop covers its platforms. Because a station alert (an escalator, a stairway) may not
   affect every route that uses the station, the summary also counts alerts at plain stops on their own, and
   the census compares tagged and missing routes at plain stops only.
@@ -117,8 +127,9 @@ with its error and the census goes on.
 - A route named in the text may be an alternative ("use route 255 instead"), so "named but not tagged" needs a
   person to read the alert.
 - A detour of one route is not checked for missing routes, because the other routes still serve those stops.
-- Trips a day are not limited to the hours an alert is active (a weekday 7 AM-4 PM stop move still counts a
-  route's evening trips).
+- Trips while active depend on the alert's periods being accurate. An agency that writes "9 PM to 5 AM" in the
+  header but gives whole days as the period gets whole-day counts.
+- Trips repeated through `frequencies.txt` count once.
 - The census is one snapshot of each feed. Agencies that tag closures only by route add nothing to its pairs.
 - The Spanish template translates the fixed wording only. Stop names and destinations stay as the schedule has
   them.
@@ -126,6 +137,10 @@ with its error and the census goes on.
 
 ## Changes
 
+- 0.5.0: trips while the alert is active, for missing and tagged routes (`trips_in_hours` in `audit.json`,
+  `findings.csv` and the census `pairs.csv`), from stop times placed in the agency's time zone, with blank
+  times filled from the stop before; summary counts of pairs with no trip in the alert's hours; the census
+  repeats its comparison on those hours only.
 - 0.4.0: reads GTFS-realtime protobuf as well as JSON (standard library decoder); trips a day for tagged
   route/stop pairs too, and summary counts for both sides; `alert_census.py`, which runs the audit on every
   keyless alerts feed in the Mobility Database catalog for the U.S. and Canada and compares tagged with

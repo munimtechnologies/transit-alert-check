@@ -173,6 +173,7 @@ class ScheduleTest(Fixture):
         self.assertEqual(self.g.agency_tz, "America/Los_Angeles")
         self.assertEqual(self.g.agencies, {"1"})
         self.assertEqual(self.g.patterns[("R10", "0")][("1001", "1002", "1003", "1004")]["trips"], 2)
+        self.assertEqual(list(self.g.times[("R10", "1002")]["WK"]), [28920, 32520, 36240])
 
     def test_resolve_and_members(self):
         self.assertEqual(self.g.resolve_stop("1002"), ("1002", "stop_id"))
@@ -224,6 +225,72 @@ class ScheduleTest(Fixture):
         self.assertEqual((g.ungrouped_trips, g.orphan_trips, g.trips), (1, 1, 3))
         self.assertIn(("R1", "s2"), g.serves)
         self.assertEqual(g.agencies, set())
+        self.assertEqual(list(g.times[("R1", "s1")]["WK"]), [-1, -1])
+
+
+class HoursTest(Fixture):
+    """Trips counted only while an alert is active."""
+
+    def test_day_start_and_periods(self):
+        self.assertEqual(tac.day_start(dt.date(2026, 10, 15)), ts(2026, 10, 15, 0))
+        self.assertEqual(tac._secs("25:10:00"), 90600)
+        self.assertIsNone(tac._secs(""))
+        self.assertIsNone(tac._secs("8:00"))
+        self.assertTrue(tac.in_periods(5, []))
+        self.assertTrue(tac.in_periods(5, [(0, 0)]))
+        self.assertFalse(tac.in_periods(5, [(6, 0)]))
+        self.assertFalse(tac.in_periods(5, [(1, 5)]))
+        self.assertTrue(tac.in_periods(5, [(9, 20), (1, 6)]))
+        self.assertEqual(tac._periods({"active_period": [{"start": 5, "end": 9}, {"start": 3}]}), [(5, 9), (3, 0)])
+
+    def test_blank_times(self):
+        files = {
+            "routes.txt": "route_id,route_short_name,route_type\nR1,1,3\n",
+            "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+                            "WK,1,1,1,1,1,0,0,20261001,20261231\n",
+            "trips.txt": "route_id,service_id,trip_id\nR1,WK,T1\nR1,WK,T2\nR1,WK,T3\n",
+            "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                              "T1,08:00:00,08:00:00,s1,1\nT1,,,s2,2\nT1,08:10:00,08:10:00,s3,3\n"
+                              "T2,,,s1,1\nT2,25:00:00,25:00:00,s2,2\nT3,,,s3,1\n",
+        }
+        path = os.path.join(self.tmp.name, "blank.zip")
+        write_zip(path, files)
+        g = tac.load_gtfs(path)
+        # A blank time takes the stop before's; a leading blank takes the first time; no times at all is -1.
+        self.assertEqual(list(g.times[("R1", "s1")]["WK"]), [28800, 90000])
+        self.assertEqual(list(g.times[("R1", "s2")]["WK"]), [28800, 90000])
+        self.assertEqual(list(g.times[("R1", "s3")]["WK"]), [29400, -1])
+        thu = dt.date(2026, 10, 15)
+        after9 = [(ts(2026, 10, 15, 9), 0)]
+        # T1 is too early; T2 reaches s1 at 1 am the next morning; T3 has no times, so it counts.
+        self.assertEqual(g.most_trips_in_periods("R1", "s1", thu, thu, after9), 1)
+        self.assertEqual(g.most_trips_in_periods("R1", "s3", thu, thu, after9), 1)
+        self.assertEqual(g.most_trips_in_periods("R1", "s3", thu, thu, []), 2)
+
+    def test_morning_closure(self):
+        # Stop 1002 closed 7:00-8:30 on two weekdays: route 10's 8:02 trip is affected, its 9:02 and 10:04
+        # trips are not, and the tagged route 20 (11:03) makes no trip there in those hours.
+        periods = [(ts(2026, 10, 15, 7), ts(2026, 10, 15, 8) + 1800), (ts(2026, 10, 16, 7), ts(2026, 10, 16, 8) + 1800)]
+        thu, fri = dt.date(2026, 10, 15), dt.date(2026, 10, 16)
+        self.assertEqual(self.g.most_trips_in_periods("R10", "1002", thu, fri, periods), 1)
+        self.assertEqual(self.g.most_trips_in_periods("R20", "1002", thu, fri, periods), 0)
+        self.assertEqual(self.g.most_trips_in_periods("R10", "1002", thu, fri, []), 3)
+        e = alert("H1", "NO_SERVICE", "STOP_CLOSURE", "Stop #1002 closed 7 to 8:30 am", "", [ie("R20", "1002")], 0)
+        e["alert"]["active_period"] = [{"start": s, "end": t} for s, t in periods]
+        r = tac.check_alert(self.g, e, FEED)
+        self.assertEqual(r["window"], ["2026-10-15", "2026-10-16"])
+        self.assertEqual(r["issues"], [{"kind": "route_missing_at_stop", "stop_id": "1002",
+                                        "stop": "#1002 1st Ave & Pike St", "routes": ["10"], "trips_a_day": [3],
+                                        "trips_in_hours": [1]}])
+        self.assertEqual(r["replay"]["tagged_pairs"], [{"route": "20", "stop_id": "1002", "trips_a_day": 1,
+                                                        "trips_in_hours": 0}])
+        self.assertEqual(tac.issue_text(r["issues"][0]),
+                         "Stop #1002 1st Ave & Pike St: route 10 also stops here on these dates but is not tagged "
+                         "(most trips in one day: 3; while the alert is active: 1)")
+        self.assertEqual(tac.issue_text({"kind": "route_missing_at_stop", "stop": "#1", "routes": ["5", "6"],
+                                         "trips_a_day": [4, 2], "trips_in_hours": [0, 2]}),
+                         "Stop #1: routes 5 and 6 also stop here on these dates but are not tagged "
+                         "(most trips in one day: 5: 4, 6: 2; while the alert is active: 5: 0, 6: 2)")
 
 
 class TextTest(unittest.TestCase):
@@ -308,8 +375,10 @@ class ProtobufTest(Fixture):
         self.assertTrue(r["stop_level"])
         self.assertEqual(r["effect_detail"], "STOP_CLOSURE")
         self.assertEqual(r["issues"], [{"kind": "route_missing_at_stop", "stop_id": "1002",
-                                        "stop": "#1002 1st Ave & Pike St", "routes": ["20"], "trips_a_day": [1]}])
-        self.assertEqual(r["replay"]["tagged_pairs"], [{"route": "10", "stop_id": "1002", "trips_a_day": 3}])
+                                        "stop": "#1002 1st Ave & Pike St", "routes": ["20"], "trips_a_day": [1],
+                                        "trips_in_hours": [1]}])
+        self.assertEqual(r["replay"]["tagged_pairs"], [{"route": "10", "stop_id": "1002", "trips_a_day": 3,
+                                                        "trips_in_hours": 3}])
         # JSON with a byte-order mark is still read as JSON; an empty file is an empty feed.
         bom = os.path.join(self.tmp.name, "bom.json")
         with open(bom, "wb") as f:
@@ -410,6 +479,7 @@ class AuditTest(Fixture):
         self.assertEqual((s["stop_level_plain"], s["stop_level_plain_missing_routes"]), (3, 3))
         self.assertEqual((s["missing_route_pairs"], s["missing_route_pairs_few_trips"]), (5, 5))
         self.assertEqual((s["tagged_route_pairs"], s["tagged_route_pairs_few_trips"]), (2, 2))
+        self.assertEqual((s["missing_route_pairs_idle"], s["tagged_route_pairs_idle"]), (0, 0))
         self.assertEqual(s["replay"], {"alert_pairs": 3, "drafted_pairs": 7, "matched": 2, "missing_routes": 5,
                                        "human_alternates": 2, "alternates_found": 2})
         self.assertEqual((s["expired"], s["open_ended"], s["future"]), (1, 1, 2))
@@ -419,17 +489,17 @@ class AuditTest(Fixture):
 
     def test_tagged_pairs(self):
         self.assertEqual(self.by_id["E1"]["replay"]["tagged_pairs"],
-                         [{"route": "10", "stop_id": "1002", "trips_a_day": 3}])
+                         [{"route": "10", "stop_id": "1002", "trips_a_day": 3, "trips_in_hours": 3}])
         self.assertEqual(self.by_id["E3"]["replay"]["tagged_pairs"], [])
         self.assertEqual(self.by_id["E4"]["replay"]["tagged_pairs"], [])
         self.assertEqual(self.by_id["E5"]["replay"]["tagged_pairs"],
-                         [{"route": "20", "stop_id": "9000", "trips_a_day": 1}])
+                         [{"route": "20", "stop_id": "9000", "trips_a_day": 1, "trips_in_hours": 1}])
         self.assertIsNone(self.by_id["E2"]["replay"])
 
     def test_each_alert(self):
         self.assertEqual(self.by_id["E1"]["issues"], [
             {"kind": "route_missing_at_stop", "stop_id": "1002", "stop": "#1002 1st Ave & Pike St", "routes": ["20"],
-             "trips_a_day": [1]}])
+             "trips_a_day": [1], "trips_in_hours": [1]}])
         self.assertEqual(self.kinds("E2"), [])
         self.assertEqual(self.kinds("E3"), ["route_not_serving_stop", "named_not_tagged", "route_missing_at_stop"])
         self.assertEqual(self.by_id["E3"]["issues"][0]["when"], "never")
@@ -439,10 +509,11 @@ class AuditTest(Fixture):
                                             "route_missing_at_stop"])
         self.assertEqual(self.by_id["E4"]["issues"][3]["routes"], ["10", "20"])
         self.assertEqual(self.by_id["E4"]["issues"][3]["trips_a_day"], [3, 1])
+        self.assertEqual(self.by_id["E4"]["issues"][3]["trips_in_hours"], [3, 1])
         self.assertEqual(self.by_id["E4"]["window"], ["2026-10-01", "2026-10-10"])
         self.assertEqual(self.by_id["E5"]["issues"], [
             {"kind": "route_missing_at_stop", "stop_id": "9000", "stop": "#9000 Central Station", "routes": ["30"],
-             "trips_a_day": [1]}])
+             "trips_a_day": [1], "trips_in_hours": [1]}])
         self.assertEqual(self.by_id["E5"]["languages"], ["en", "es"])
         self.assertTrue(self.by_id["E5"]["at_station"])
         self.assertFalse(self.by_id["E1"]["at_station"])
@@ -475,6 +546,8 @@ class AuditTest(Fixture):
                       "stop: 5", md)
         self.assertIn("- Tagged route/stop pairs the schedule confirms in those alerts: 2; with at most 4 trips a "
                       "day: 2", md)
+        self.assertIn("while the alert is active (the alert may rightly leave them out): 0; tagged pairs with "
+                      "none: 0", md)
         self.assertIn("with AI agents", md)
         rp = tac.replay_markdown(self.result)
         self.assertIn("## Alert E1 (NO_SERVICE / STOP_CLOSURE)", rp)
@@ -520,9 +593,9 @@ class CommandTest(Fixture):
         with open(os.path.join(out, "findings.csv"), encoding="utf-8", newline="") as f:
             rows = list(csv.reader(f))
         self.assertEqual(len(rows), 11)
-        self.assertEqual(rows[0][-1], "trips_a_day")
+        self.assertEqual(rows[0][-2:], ["trips_a_day", "trips_in_hours"])
         self.assertEqual(rows[1][:4], ["E1", "NO_SERVICE", "STOP_CLOSURE", "route_missing_at_stop"])
-        self.assertEqual(rows[1][-1], "1")
+        self.assertEqual(rows[1][-2:], ["1", "1"])
         path = os.path.join(self.tmp.name, "draft.json")
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(tac.main(["draft", "--gtfs", self.zip, "--stops", "1002", "--start", "2026-10-14",

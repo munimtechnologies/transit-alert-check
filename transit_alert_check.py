@@ -10,8 +10,9 @@ or JSON) and its static GTFS, and lists, for every alert:
 - tagged route/stop pairs where the route does not stop there on the alert's dates;
 - for stop closures, stop moves and accessibility alerts, routes that do stop
   there on those dates but are not tagged (their riders may not see the alert),
-  with the most trips each runs there in one day, and the same count for the
-  routes that are tagged, so the two can be compared;
+  with the most trips each runs there in one day, in all and while the alert is
+  active, and the same counts for the routes that are tagged, so the two can be
+  compared;
 - route numbers named in the text but not tagged, and stop numbers in the text
   that are not tagged or not in the schedule;
 - tagged routes that the text leaves out when it lists the affected routes
@@ -41,9 +42,10 @@ import sys
 import time
 import urllib.request
 import zipfile
+from array import array
 from collections import Counter, defaultdict
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 REPO_URL = "https://github.com/munimtechnologies/transit-alert-check"
 USER_AGENT = "transit-alert-check/%s (+%s)" % (__version__, REPO_URL)
@@ -117,6 +119,18 @@ def _float(value):
         return None
 
 
+def _secs(value):
+    """A GTFS time ('08:02:00', '25:10:00') as seconds from the start of the service day, or None if blank."""
+    parts = (value or "").split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        h, m, s = (int(p) for p in parts)
+    except ValueError:
+        return None
+    return h * 3600 + m * 60 + s
+
+
 def route_sort_key(name):
     m = re.match(r"(\d+)", name or "")
     return (0, int(m.group(1)), name) if m else (1, 0, name or "")
@@ -144,6 +158,7 @@ class Gtfs:
         self.serves = defaultdict(set)      # (route_id, stop_id) -> service_ids
         self.serves_dir = defaultdict(set)  # (route_id, direction_id, stop_id) -> service_ids
         self.trip_counts = defaultdict(Counter)  # (route_id, stop_id) -> {service_id: trips}
+        self.times = defaultdict(dict)      # (route_id, stop_id) -> {service_id: array of seconds}
         self.patterns = defaultdict(dict)   # (route_id, direction_id) -> {stop tuple: info}
         self.calendar = {}
         self.exceptions = defaultdict(dict)
@@ -158,11 +173,24 @@ class Gtfs:
             return
         self.trips += 1
         route, direction, service, headsign = info
-        stops = tuple(s for _, s in sorted(stop_rows))
-        for s in set(stops):
+        rows = sorted(stop_rows, key=lambda r: (r[0], r[1]))
+        stops = tuple(s for _, s, _ in rows)
+        # When the trip first reaches each stop. A blank time (a stop between timepoints) takes the
+        # time of the stop before; -1 when the trip has no times at all.
+        known = [t for _, _, t in rows if t is not None]
+        last, reach = (known[0] if known else -1), {}
+        for _, s, t in rows:
+            if t is not None:
+                last = t
+            reach.setdefault(s, last)
+        for s in reach:
             self.serves[(route, s)].add(service)
             self.serves_dir[(route, direction, s)].add(service)
             self.trip_counts[(route, s)][service] += 1
+            times = self.times[(route, s)]
+            if service not in times:
+                times[service] = array("i")
+            times[service].append(reach[s])
         p = self.patterns[(route, direction)].get(stops)
         if p is None:
             p = self.patterns[(route, direction)][stops] = {"trips": 0, "services": set(), "headsigns": Counter()}
@@ -244,6 +272,21 @@ class Gtfs:
             day += dt.timedelta(days=1)
         return best
 
+    def most_trips_in_periods(self, route, stop, first, last, periods, tz=None):
+        """Like most_daily_trips, counting only the trips that reach the stop while the alert is active:
+        inside one of periods ((start, end) in epoch seconds, 0 for open). Trips with no times count."""
+        times = defaultdict(list)
+        for s in self.members(stop):
+            for service, secs in self.times.get((route, s), {}).items():
+                times[service].extend(secs)
+        best, day = 0, first
+        while day <= last:
+            base = day_start(day, tz)
+            best = max(best, sum(1 for service, secs in times.items() if self.active_on(service, day)
+                                 for t in secs if t < 0 or in_periods(base + t, periods)))
+            day += dt.timedelta(days=1)
+        return best
+
     def stats(self):
         dates = [d for c in self.calendar.values() for d in c[1:] if d]
         dates += [d for ex in self.exceptions.values() for d in ex]
@@ -315,7 +358,8 @@ def load_gtfs(path):
                 if tid in done:
                     g.ungrouped_trips += 1
                 current, stops = tid, []
-            stops.append((_int(r.get("stop_sequence")), r["stop_id"]))
+            stops.append((_int(r.get("stop_sequence")), r["stop_id"],
+                          _secs(r.get("departure_time") or r.get("arrival_time"))))
         if current is not None:
             g.add_trip(trips.get(current), stops)
     return g
@@ -469,15 +513,29 @@ def load_for_check(path):
     return []
 
 
-def local_date(ts, tz_name=None):
-    when = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
+def _zone(tz_name):
     if tz_name:
         try:
             from zoneinfo import ZoneInfo
-            when = when.astimezone(ZoneInfo(tz_name))
+            return ZoneInfo(tz_name)
         except Exception:  # no zoneinfo or no time zone data: stay in UTC
             pass
-    return when.date()
+    return dt.timezone.utc
+
+
+def local_date(ts, tz_name=None):
+    return dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).astimezone(_zone(tz_name)).date()
+
+
+def day_start(day, tz_name=None):
+    """Epoch seconds of noon minus 12 hours on a service day: the time GTFS stop times count from."""
+    noon = dt.datetime(day.year, day.month, day.day, 12, tzinfo=_zone(tz_name))
+    return int(noon.timestamp()) - 12 * 3600
+
+
+def in_periods(when, periods):
+    """True when an epoch time falls in one of the (start, end) periods (0 for open), or there are none."""
+    return not periods or any((not s or s <= when) and (not e or when < e) for s, e in periods)
 
 
 def alert_window(start, end, feed_ts, tz=None):
@@ -521,15 +579,20 @@ def _dedupe(issues):
     return out
 
 
-def _period(alert):
-    """(start, end) of the alert. The schedule is checked when service is affected, so impact_period
-    (GTFS-realtime, June 2026) comes first, then active_period, then communication_period."""
+def _periods(alert):
+    """(start, end) of each period of the alert, 0 for open. The schedule is checked when service is
+    affected, so impact_period (GTFS-realtime, June 2026) comes first, then active_period, then
+    communication_period."""
     periods = (_get(alert, "impact_period") or _get(alert, "active_period")
                or _get(alert, "communication_period") or [])
-    starts = [_int(_get(p, "start")) for p in periods]
-    ends = [_int(_get(p, "end")) for p in periods]
-    start = min(starts) if starts else 0
-    end = max(ends) if ends and all(ends) else 0
+    return [(_int(_get(p, "start")), _int(_get(p, "end"))) for p in periods]
+
+
+def _period(alert):
+    """(start, end) of the alert as a whole: the earliest start, and the latest end (0 if a period is open)."""
+    periods = _periods(alert)
+    start = min(s for s, _ in periods) if periods else 0
+    end = max(e for _, e in periods) if periods and all(e for _, e in periods) else 0
     return start, end
 
 
@@ -541,6 +604,7 @@ def check_alert(g, entity, feed_ts, tz=None):
     header_f, desc_f = _get(a, "header_text"), _get(a, "description_text")
     header, desc = text_of(header_f), text_of(desc_f)
     start, end = _period(a)
+    periods = _periods(a)
     first, last = alert_window(start, end, feed_ts, tz)
     services = g.services_between(first, last)
 
@@ -615,10 +679,13 @@ def check_alert(g, entity, feed_ts, tz=None):
             by_stop[s].append(r)
         for s in sorted(by_stop):
             routes = sorted(by_stop[s], key=lambda r: route_sort_key(g.route_name(r)))
-            # Routes with few trips at a stop (peak-only, school, early-morning) are the easiest to leave out.
+            # Routes with few trips at a stop (peak-only, school, early-morning) are the easiest to leave out;
+            # a route with no trip there while the alert is active may rightly be left out.
             issues.append({"kind": "route_missing_at_stop", "stop_id": s, "stop": g.stop_label(s),
                            "routes": [g.route_name(r) for r in routes],
-                           "trips_a_day": [g.most_daily_trips(r, s, first, last) for r in routes]})
+                           "trips_a_day": [g.most_daily_trips(r, s, first, last) for r in routes],
+                           "trips_in_hours": [g.most_trips_in_periods(r, s, first, last, periods, tz)
+                                              for r in routes]})
         closed = {m for s in tagged for m in g.members(s)} | {g.stops[s]["parent"] for s in tagged if g.stops[s]["parent"]}
         human = set()
         for n in all_nums:
@@ -628,9 +695,10 @@ def check_alert(g, entity, feed_ts, tz=None):
         replay = {"alert_pairs": len(alert_pairs), "drafted_pairs": len(made), "matched": len(alert_pairs & made),
                   "missing_routes": len(missing), "human_alternates": len(human),
                   "alternates_found": len(human & set(drafted["alternates"])),
-                  # The same trip count for the tagged routes the schedule confirms, to compare with missing ones.
+                  # The same trip counts for the tagged routes the schedule confirms, to compare with missing ones.
                   "tagged_pairs": [{"route": g.route_name(r), "stop_id": s,
-                                    "trips_a_day": g.most_daily_trips(r, s, first, last)}
+                                    "trips_a_day": g.most_daily_trips(r, s, first, last),
+                                    "trips_in_hours": g.most_trips_in_periods(r, s, first, last, periods, tz)}
                                    for r, s in sorted(alert_pairs & made)]}
 
     return {
@@ -814,9 +882,11 @@ def audit(g, alerts, feed_ts, tz=None):
     stop_level = [r for r in records if r["stop_level"]]
     replays = [r["replay"] for r in records if r["replay"]]
     headers = [r["header_chars"] for r in records if r["header_chars"]]
-    missing_trips = [n for r in records for i in r["issues"] if i["kind"] == "route_missing_at_stop"
-                     for n in i.get("trips_a_day", [])]
-    tagged_trips = [p["trips_a_day"] for x in replays for p in x.get("tagged_pairs", [])]
+    missing = [i for r in records for i in r["issues"] if i["kind"] == "route_missing_at_stop"]
+    missing_trips = [n for i in missing for n in i.get("trips_a_day", [])]
+    missing_hours = [n for i in missing for n in i.get("trips_in_hours", [])]
+    tagged = [p for x in replays for p in x.get("tagged_pairs", [])]
+    tagged_trips = [p["trips_a_day"] for p in tagged]
     summary = {
         "alerts": len(records),
         "with_issue": sum(1 for r in records if r["issues"]),
@@ -831,8 +901,11 @@ def audit(g, alerts, feed_ts, tz=None):
             i["kind"] == "route_missing_at_stop" for i in r["issues"])),
         "missing_route_pairs": len(missing_trips),
         "missing_route_pairs_few_trips": sum(1 for n in missing_trips if n <= FEW_TRIPS),
+        # Pairs whose route makes no trip at the stop while the alert is active.
+        "missing_route_pairs_idle": sum(1 for n in missing_hours if n == 0),
         "tagged_route_pairs": len(tagged_trips),
         "tagged_route_pairs_few_trips": sum(1 for n in tagged_trips if n <= FEW_TRIPS),
+        "tagged_route_pairs_idle": sum(1 for p in tagged if p.get("trips_in_hours") == 0),
         "replay": {k: sum(x[k] for x in replays) for k in ("alert_pairs", "drafted_pairs", "matched",
                                                           "missing_routes", "human_alternates",
                                                           "alternates_found")},
@@ -866,11 +939,17 @@ def issue_text(i):
         else:
             text = "Stop %s: routes %s also stop here on these dates but are not tagged" % (i["stop"],
                                                                                             _join(i["routes"]))
+
+        def counts(ns):
+            return "%d" % ns[0] if len(ns) == 1 else ", ".join("%s: %d" % rn for rn in zip(i["routes"], ns))
+
         trips = i.get("trips_a_day") or []
-        if len(trips) == 1:
-            text += " (most trips in one day: %d)" % trips[0]
-        elif trips:
-            text += " (most trips in one day: %s)" % ", ".join("%s: %d" % rn for rn in zip(i["routes"], trips))
+        hours = i.get("trips_in_hours") or []
+        if trips:
+            text += " (most trips in one day: %s" % counts(trips)
+            if hours and hours != trips:
+                text += "; while the alert is active: %s" % counts(hours)
+            text += ")"
         return text
     if k == "route_not_serving_stop":
         return "Route %s is tagged at stop %s but does not stop there %s" % (
@@ -909,6 +988,8 @@ def report_markdown(result):
         % (s["missing_route_pairs"], FEW_TRIPS, s["missing_route_pairs_few_trips"]),
         "- Tagged route/stop pairs the schedule confirms in those alerts: %d; with at most %d trips a day: %d"
         % (s["tagged_route_pairs"], FEW_TRIPS, s["tagged_route_pairs_few_trips"]),
+        "- Untagged pairs whose route makes no trip there while the alert is active (the alert may rightly leave "
+        "them out): %d; tagged pairs with none: %d" % (s["missing_route_pairs_idle"], s["tagged_route_pairs_idle"]),
         "- Alerts whose text lists routes but leaves out a tagged one: %d"
         % s["alerts_by_kind"].get("tagged_not_named", 0),
         "- Drafter replay on those alerts: it reproduced %d of the %d tagged route/stop pairs from the schedule "
@@ -954,7 +1035,8 @@ def report_markdown(result):
         "name appears nowhere in it.",
         "- Each alert is checked against the first %d days of its active period, or the days it ran if it has "
         "ended. Routes are matched to stops through the schedule's trips, not through maps. Trips a day count "
-        "the whole day, not only the hours an alert is active." % WINDOW_DAYS,
+        "the whole day; trips while the alert is active count only those that reach the stop inside one of its "
+        "periods (a blank stop time takes the time of the stop before)." % WINDOW_DAYS,
         "- A detour of one route is not checked for missing routes, because other routes still serve those stops.",
         "",
         "Made by MV2 of Munim, Inc. with AI agents. Code Apache-2.0; this report CC BY 4.0. Source data: the "
@@ -996,13 +1078,14 @@ def write_outputs(result, out_dir):
     with open(os.path.join(out_dir, "findings.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(("alert_id", "effect", "effect_detail", "kind", "route", "stop_id", "stop", "when", "header",
-                    "trips_a_day"))
+                    "trips_a_day", "trips_in_hours"))
         for r in result["alerts"]:
             for i in r["issues"]:
                 w.writerow((r["id"], r["effect"], r["effect_detail"], i["kind"],
                             i.get("route") or "; ".join(i.get("routes", [])) or i.get("route_id", ""),
                             i.get("stop_id", ""), i.get("stop", ""), i.get("when", ""), r["header"],
-                            "; ".join(str(n) for n in i.get("trips_a_day", []))))
+                            "; ".join(str(n) for n in i.get("trips_a_day", [])),
+                            "; ".join(str(n) for n in i.get("trips_in_hours", []))))
 
 
 # ---------------------------------------------------------------- command line

@@ -85,6 +85,19 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(r["sign_test_p"], 1.0)
         self.assertEqual(r["agencies_with_pairs"], 2)
 
+    def test_pooled_in_hours(self):
+        # Pairs with no trip while the alert is active are left out, tagged or not.
+        def p(alert, route, tagged, trips, hours):
+            return {"feed": "1", "alert_id": alert, "at_station": 0, "route": route, "tagged": tagged,
+                    "trips_a_day": trips, "trips_in_hours": hours}
+        records = [{"pairs": [p("A", "10", 1, 40, 12), p("A", "11", 0, 3, 0), p("A", "12", 0, 9, 2),
+                              p("B", "10", 1, 6, 0), p("B", "13", 0, 5, 5)]}]
+        r = ac.pooled(records, "trips_in_hours")
+        self.assertEqual(r["tagged"], {"pairs": 1, "median_trips": 12, "few_trips": 0})
+        self.assertEqual(r["missing"], {"pairs": 2, "median_trips": 3.5, "few_trips": 1})
+        self.assertEqual((r["alerts_with_both"], r["missing_runs_less"]), (1, 1))
+        self.assertEqual(ac.pooled(records)["missing"]["pairs"], 3)
+
 
 class EndToEndTest(unittest.TestCase):
     """The whole census on local files: a catalog with one usable feed, read through file:// URLs."""
@@ -122,16 +135,19 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(census["pooled"]["tagged"], {"pairs": 1, "median_trips": 3, "few_trips": 1})
             self.assertEqual(census["pooled"]["missing"], {"pairs": 1, "median_trips": 1, "few_trips": 1})
             self.assertEqual(census["pooled"]["missing_runs_less"], 1)
+            self.assertEqual(census["pooled_in_hours"]["tagged"], {"pairs": 1, "median_trips": 3, "few_trips": 1})
+            self.assertEqual(census["pooled_in_hours"]["missing"], {"pairs": 1, "median_trips": 1, "few_trips": 1})
             self.assertTrue(os.path.exists(os.path.join(data, "gtfs-1.zip")))
             self.assertTrue(os.path.exists(os.path.join(out, "agencies", "10", "audit.md")))
             with open(os.path.join(out, "pairs.csv"), encoding="utf-8", newline="") as f:
                 pairs = list(csv.DictReader(f))
-            self.assertEqual([(p["route"], p["tagged"], p["trips_a_day"]) for p in pairs],
-                             [("10", "1", "3"), ("20", "0", "1")])
+            self.assertEqual([(p["route"], p["tagged"], p["trips_a_day"], p["trips_in_hours"]) for p in pairs],
+                             [("10", "1", "3", "3"), ("20", "0", "1", "1")])
             with open(os.path.join(out, "census.md"), encoding="utf-8") as f:
                 md = f.read()
             self.assertIn("| Tagged by staff (and in the schedule) | 1 | 3 | 1 |", md)
             self.assertIn("| In the schedule but not tagged | 1 | 1 | 1 |", md)
+            self.assertIn("Of the 1 untagged pairs at plain stops, 0 make no trip there in the alert's hours.", md)
             self.assertIn("- Alerts feeds run: 3 (error 1, no_alerts 1, ok 1)", md)
             self.assertIn("| 10 | Metro Transit | ok | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |", md)
             self.assertIn("## Feeds that could not be read", md)
