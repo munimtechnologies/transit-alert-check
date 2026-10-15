@@ -168,6 +168,17 @@ class ScheduleTest(Fixture):
         self.assertEqual(g.served("R20", "1002", 1, {"WK"}), "never")
         self.assertEqual(g.served("R10", "1002", None, set()), "unknown")
 
+    def test_most_daily_trips(self):
+        g = self.g
+        wed, sat = dt.date(2026, 10, 14), dt.date(2026, 10, 17)
+        self.assertEqual(g.most_daily_trips("R10", "1002", wed, wed), 3)
+        self.assertEqual(g.most_daily_trips("R20", "1002", wed, wed), 1)
+        self.assertEqual(g.most_daily_trips("R10", "1002", sat, sat), 0)
+        # A station counts its platforms; weekend service runs on Thanksgiving.
+        self.assertEqual(g.most_daily_trips("R30", "9000", wed, sat), 1)
+        self.assertEqual(g.most_daily_trips("R30", "1003", dt.date(2026, 11, 26), dt.date(2026, 11, 26)), 1)
+        self.assertEqual(g.most_daily_trips("R10", "1002", dt.date(2026, 11, 27), dt.date(2026, 11, 27)), 0)
+
     def test_ungrouped_stop_times(self):
         files = {
             "routes.txt": "route_id,route_short_name,route_type\nR1,1,3\n",
@@ -213,8 +224,19 @@ class TextTest(unittest.TestCase):
         self.assertEqual(tac.text_of(None), "")
         self.assertTrue(tac.is_stop_level("NO_SERVICE", "STOP_CLOSURE"))
         self.assertTrue(tac.is_stop_level("ACCESSIBILITY_ISSUE", ""))
+        self.assertTrue(tac.is_stop_level("STOP_MOVED", "STOP_MOVE"))
+        self.assertTrue(tac.is_stop_level("NO_SERVICE", "STATION_CLOSURE"))
         self.assertFalse(tac.is_stop_level("DETOUR", "SINGLE_ROUTE_REROUTE"))
         self.assertFalse(tac.is_stop_level("NO_SERVICE", "ROUTE_SUSPENSION"))
+
+    def test_period_fields(self):
+        self.assertEqual(tac._period({"active_period": [{"start": 5, "end": 9}, {"start": 3, "end": 7}]}), (3, 9))
+        self.assertEqual(tac._period({"active_period": [{"start": 5, "end": 9}, {"start": 3}]}), (3, 0))
+        # Service is affected in impact_period; communication_period only says when to show the alert.
+        self.assertEqual(tac._period({"communication_period": [{"start": 1, "end": 20}],
+                                      "impact_period": [{"start": 5, "end": 9}]}), (5, 9))
+        self.assertEqual(tac._period({"communicationPeriod": [{"start": 1, "end": 20}]}), (1, 20))
+        self.assertEqual(tac._period({}), (0, 0))
 
     def test_window(self):
         self.assertEqual(tac.alert_window(FEED, ts(2026, 12, 31), FEED), (dt.date(2026, 10, 14), dt.date(2026, 10, 27)))
@@ -242,7 +264,36 @@ class DraftTest(Fixture):
             {"route_id": "R10", "stop_id": "1002", "agency_id": "1", "route_type": 3},
             {"route_id": "R20", "stop_id": "1002", "agency_id": "1", "route_type": 3}])
         self.assertEqual(a["active_period"], [{"start": FEED, "end": ts(2026, 12, 31)}])
-        self.assertEqual((a["cause"], a["effect"]), ("CONSTRUCTION", "NO_SERVICE"))
+        self.assertEqual((a["cause"], a["effect"], a["effect_detail"]), ("CONSTRUCTION", "NO_SERVICE", "STOP_CLOSURE"))
+        self.assertEqual([t["language"] for t in a["header_text"]["translation"]], ["en"])
+        self.assertIsNone(d["header_es"])
+
+    def test_spanish(self):
+        d = tac.draft(self.g, ["1002"], FEED, ts(2026, 12, 31), "CONSTRUCTION", feed_ts=FEED, spanish=True)
+        self.assertEqual(d["header_es"], "Parada #1002 1st Ave & Pike St cerrada desde el mié 14 de oct de 2026 "
+                                         "hasta el jue 31 de dic de 2026 por obras.")
+        self.assertEqual(d["description_es"], "\n".join([
+            "Rutas afectadas:", "10", "20", "", "Suba o baje en:",
+            "Ruta 10 hacia Downtown: #1001 1st Ave & Pine St o #1003 1st Ave & Union St",
+            "Ruta 10 hacia Northgate: #1003 1st Ave & Union St o #1001 1st Ave & Pine St",
+            "Ruta 20 hacia Pioneer Sq: #52001 3rd Ave & Pike St o #9001 Central Station Bay 1"]))
+        a = d["entity"]["alert"]
+        self.assertEqual(a["header_text"]["translation"], [{"text": d["header"], "language": "en"},
+                                                           {"text": d["header_es"], "language": "es"}])
+        self.assertEqual([t["language"] for t in a["description_text"]["translation"]], ["en", "es"])
+        self.assertIn("qualified translator", d["review"])
+        many = tac.draft(self.g, ["1002", "1003"], FEED, None, feed_ts=FEED, spanish=True)
+        self.assertEqual(many["header_es"], "2 paradas cerradas en las rutas 10, 20 y 30 desde el mié 14 de oct "
+                                            "de 2026 hasta nuevo aviso.")
+
+    def test_stop_moved(self):
+        d = tac.draft(self.g, ["1002"], FEED, None, "CONSTRUCTION", "STOP_MOVED", feed_ts=FEED, spanish=True)
+        self.assertEqual(d["header"], "Stop #1002 1st Ave & Pike St relocated from Wed Oct 14, 2026 until further "
+                                      "notice due to construction.")
+        self.assertTrue(d["header_es"].startswith("Parada #1002 1st Ave & Pike St reubicada desde el mié"))
+        self.assertEqual(d["entity"]["alert"]["effect_detail"], "STOP_MOVE")
+        elevator = tac.draft(self.g, ["9000"], FEED, None, effect="ACCESSIBILITY_ISSUE", feed_ts=FEED)
+        self.assertNotIn("effect_detail", elevator["entity"]["alert"])
 
     def test_station_on_a_weekend(self):
         d = tac.draft(self.g, ["9000"], ts(2026, 10, 24), ts(2026, 10, 25))
@@ -280,6 +331,7 @@ class AuditTest(Fixture):
                                        "unknown_stop_in_text": 1})
         self.assertEqual((s["stop_level"], s["stop_level_missing_routes"]), (4, 4))
         self.assertEqual((s["stop_level_plain"], s["stop_level_plain_missing_routes"]), (3, 3))
+        self.assertEqual((s["missing_route_pairs"], s["missing_route_pairs_few_trips"]), (5, 5))
         self.assertEqual(s["replay"], {"alert_pairs": 3, "drafted_pairs": 7, "matched": 2, "missing_routes": 5,
                                        "human_alternates": 2, "alternates_found": 2})
         self.assertEqual((s["expired"], s["open_ended"], s["future"]), (1, 1, 2))
@@ -289,17 +341,21 @@ class AuditTest(Fixture):
 
     def test_each_alert(self):
         self.assertEqual(self.by_id["E1"]["issues"], [
-            {"kind": "route_missing_at_stop", "stop_id": "1002", "stop": "#1002 1st Ave & Pike St", "routes": ["20"]}])
+            {"kind": "route_missing_at_stop", "stop_id": "1002", "stop": "#1002 1st Ave & Pike St", "routes": ["20"],
+             "trips_a_day": [1]}])
         self.assertEqual(self.kinds("E2"), [])
         self.assertEqual(self.kinds("E3"), ["route_not_serving_stop", "named_not_tagged", "route_missing_at_stop"])
         self.assertEqual(self.by_id["E3"]["issues"][0]["when"], "never")
         self.assertEqual(self.by_id["E3"]["issues"][1]["route"], "30")
+        self.assertEqual(self.by_id["E3"]["issues"][2]["trips_a_day"], [3])
         self.assertEqual(self.kinds("E4"), ["unknown_route", "unknown_stop", "unknown_stop_in_text",
                                             "route_missing_at_stop"])
         self.assertEqual(self.by_id["E4"]["issues"][3]["routes"], ["10", "20"])
+        self.assertEqual(self.by_id["E4"]["issues"][3]["trips_a_day"], [3, 1])
         self.assertEqual(self.by_id["E4"]["window"], ["2026-10-01", "2026-10-10"])
         self.assertEqual(self.by_id["E5"]["issues"], [
-            {"kind": "route_missing_at_stop", "stop_id": "9000", "stop": "#9000 Central Station", "routes": ["30"]}])
+            {"kind": "route_missing_at_stop", "stop_id": "9000", "stop": "#9000 Central Station", "routes": ["30"],
+             "trips_a_day": [1]}])
         self.assertEqual(self.by_id["E5"]["languages"], ["en", "es"])
         self.assertTrue(self.by_id["E5"]["at_station"])
         self.assertFalse(self.by_id["E1"]["at_station"])
@@ -308,6 +364,16 @@ class AuditTest(Fixture):
         self.assertEqual(self.by_id["E7"]["issues"][0]["when"], "off_dates")
         self.assertEqual(self.by_id["E1"]["draft"]["routes"], ["10", "20"])
         self.assertIsNone(self.by_id["E2"]["draft"])
+
+    def test_issue_text_with_trips(self):
+        self.assertEqual(tac.issue_text(self.by_id["E1"]["issues"][0]),
+                         "Stop #1002 1st Ave & Pike St: route 20 also stops here on these dates but is not tagged "
+                         "(most trips in one day: 1)")
+        self.assertEqual(tac.issue_text(self.by_id["E4"]["issues"][3]),
+                         "Stop #1002 1st Ave & Pike St: routes 10 and 20 also stop here on these dates but are not "
+                         "tagged (most trips in one day: 10: 3, 20: 1)")
+        self.assertEqual(tac.issue_text({"kind": "route_missing_at_stop", "stop": "#1", "routes": ["5"]}),
+                         "Stop #1: route 5 also stops here on these dates but is not tagged")
 
     def test_reports(self):
         md = tac.report_markdown(self.result)
@@ -318,6 +384,8 @@ class AuditTest(Fixture):
         self.assertIn("- Alerts whose text lists routes but leaves out a tagged one: 0", md)
         self.assertIn("- Of these, at a plain stop rather than a station or its platforms: 3; missing at least "
                       "one route: 3", md)
+        self.assertIn("- Untagged route/stop pairs in those alerts: 5; of these, with at most 4 trips a day at that "
+                      "stop: 5", md)
         self.assertIn("with AI agents", md)
         rp = tac.replay_markdown(self.result)
         self.assertIn("## Alert E1 (NO_SERVICE / STOP_CLOSURE)", rp)
@@ -363,7 +431,9 @@ class CommandTest(Fixture):
         with open(os.path.join(out, "findings.csv"), encoding="utf-8", newline="") as f:
             rows = list(csv.reader(f))
         self.assertEqual(len(rows), 11)
+        self.assertEqual(rows[0][-1], "trips_a_day")
         self.assertEqual(rows[1][:4], ["E1", "NO_SERVICE", "STOP_CLOSURE", "route_missing_at_stop"])
+        self.assertEqual(rows[1][-1], "1")
         path = os.path.join(self.tmp.name, "draft.json")
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(tac.main(["draft", "--gtfs", self.zip, "--stops", "1002", "--start", "2026-10-14",
@@ -372,6 +442,43 @@ class CommandTest(Fixture):
         with open(path, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["entity"]["alert"]["active_period"][0]["start"], FEED)
         self.assertEqual(tac.parse_when("1792022183"), 1792022183)
+
+    def test_spanish_draft_command(self):
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(tac.main(["draft", "--gtfs", self.zip, "--stops", "1002", "--start", "2026-10-14",
+                                       "--cause", "CONSTRUCTION", "--spanish"]), 0)
+        self.assertIn("Parada #1002 1st Ave & Pike St cerrada desde el mié 14 de oct de 2026 hasta nuevo aviso "
+                      "por obras.", printed.getvalue())
+
+    def test_check_command(self):
+        # A fresh draft passes its own checks.
+        path = os.path.join(self.tmp.name, "draft_for_check.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            tac.main(["draft", "--gtfs", self.zip, "--stops", "1002", "--start", "2026-10-14", "--end", "2026-12-31",
+                      "--cause", "CONSTRUCTION", "--out", path])
+        self.assertEqual(len(tac.load_for_check(path)), 1)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(tac.main(["check", "--gtfs", self.zip, "--alert", path, "--now", "2026-10-14"]), 0)
+        self.assertIn("No findings.", printed.getvalue())
+        # A hand-written alert that leaves out route 20 fails, and says why.
+        bare = os.path.join(self.tmp.name, "bare.json")
+        with open(bare, "w", encoding="utf-8") as f:
+            json.dump(alert("B1", "NO_SERVICE", "STOP_CLOSURE", "Stop #1002 1st Ave & Pike St closed.",
+                            "Affected routes:\n10", [ie("R10", "1002")], FEED, ts(2026, 12, 31))["alert"], f)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(tac.main(["check", "--gtfs", self.zip, "--alert", bare, "--now", "2026-10-14"]), 1)
+        self.assertIn("route 20 also stops here on these dates but is not tagged (most trips in one day: 1)",
+                      printed.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(tac.main(["check", "--gtfs", self.zip, "--alert", bare, "--now", "2026-10-14",
+                                       "--json"]), 1)
+        self.assertEqual(json.loads(printed.getvalue())[0]["issues"][0]["routes"], ["20"])
+        self.assertEqual(len(tac.load_for_check(self.alerts_path)), 7)
+        empty = os.path.join(self.tmp.name, "empty.json")
+        with open(empty, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(tac.main(["check", "--gtfs", self.zip, "--alert", empty]), 2)
 
 
 if __name__ == "__main__":

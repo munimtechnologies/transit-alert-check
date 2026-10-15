@@ -9,7 +9,8 @@ its static GTFS, and lists, for every alert:
 - stop and route IDs that are not in the schedule;
 - tagged route/stop pairs where the route does not stop there on the alert's dates;
 - for stop closures, stop moves and accessibility alerts, routes that do stop
-  there on those dates but are not tagged (their riders may not see the alert);
+  there on those dates but are not tagged (their riders may not see the alert),
+  with the most trips each runs there in one day;
 - route numbers named in the text but not tagged, and stop numbers in the text
   that are not tagged or not in the schedule;
 - tagged routes that the text leaves out when it lists the affected routes
@@ -17,9 +18,11 @@ its static GTFS, and lists, for every alert:
 
 The drafter works the other way: given the stops that close and the dates, it
 finds every route and direction that serves them, the nearest open stop before
-and after on each, and writes the alert text and a GTFS-realtime entity for a
-person to review. Replaying it on the agency's live stop closures measures how
-often it agrees with the alerts staff wrote.
+and after on each, and writes the alert text (in English, and from a fixed
+template in Spanish if asked) and a GTFS-realtime entity for a person to review.
+Replaying it on the agency's live stop closures measures how often it agrees
+with the alerts staff wrote. `check` runs the same checks on one alert or draft
+before it is published.
 
 Defaults point at King County Metro's public feeds. Standard library only,
 Python 3.8+. Made by MV2 of Munim, Inc. with AI agents. Apache-2.0 license.
@@ -39,7 +42,7 @@ import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 REPO_URL = "https://github.com/munimtechnologies/transit-alert-check"
 USER_AGENT = "transit-alert-check/%s (+%s)" % (__version__, REPO_URL)
@@ -49,12 +52,13 @@ KCM_GTFS_URL = ("https://metro.kingcounty.gov/GTFS/google_transit.zip,"
 KCM_ALERTS_URL = "https://s3.amazonaws.com/kcm-alerts-realtime-prod/alerts_pb.json"
 WINDOW_DAYS = 14  # schedule days checked from the start of each alert
 LONG_HEADER = 160  # characters
+FEW_TRIPS = 4  # a missing route with at most this many trips a day at the stop
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 # Effects where the stop itself is closed, moved or hard to use, so every route
 # that stops there is affected (unlike a detour of one route).
 STOP_LEVEL_EFFECTS = ("STOP_MOVED", "ACCESSIBILITY_ISSUE")
-STOP_LEVEL_DETAIL_RE = re.compile(r"STOP|ELEVATOR|ESCALATOR", re.I)
+STOP_LEVEL_DETAIL_RE = re.compile(r"STOP|STATION|ELEVATOR|ESCALATOR", re.I)
 CAUSE_WORDS = {
     "CONSTRUCTION": "construction",
     "MAINTENANCE": "maintenance",
@@ -63,6 +67,21 @@ CAUSE_WORDS = {
     "DEMONSTRATION": "a demonstration",
     "HOLIDAY": "a holiday",
 }
+# Spanish drafts come from a fixed template; stop names and headsigns stay as the schedule has them.
+CAUSE_WORDS_ES = {
+    "CONSTRUCTION": "obras",
+    "MAINTENANCE": "mantenimiento",
+    "WEATHER": "el clima",
+    "POLICE_ACTIVITY": "actividad policial",
+    "DEMONSTRATION": "una manifestación",
+    "HOLIDAY": "un día festivo",
+}
+DAYS_ES = ("lun", "mar", "mié", "jue", "vie", "sáb", "dom")
+MONTHS_ES = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic")
+# Verb for the header (English, Spanish singular, Spanish plural) and effect_detail, by effect.
+CLOSED = ("closed", "cerrada", "cerradas")
+VERBS = {"STOP_MOVED": ("relocated", "reubicada", "reubicadas")}
+DETAILS = {"STOP_MOVED": "STOP_MOVE", "ACCESSIBILITY_ISSUE": ""}
 
 _ROUTE_TOKEN = r"(?:[0-9]{1,3}[A-Za-z]?|[A-Za-z] Line)\b"
 ROUTE_NAMES_RE = re.compile(
@@ -102,11 +121,11 @@ def route_sort_key(name):
     return (0, int(m.group(1)), name) if m else (1, 0, name or "")
 
 
-def _join(names):
+def _join(names, word="and"):
     names = list(names)
     if len(names) < 2:
         return "".join(names)
-    return ", ".join(names[:-1]) + " and " + names[-1]
+    return ", ".join(names[:-1]) + " %s " % word + names[-1]
 
 
 # ---------------------------------------------------------------- schedule
@@ -123,6 +142,7 @@ class Gtfs:
         self.children = defaultdict(list)
         self.serves = defaultdict(set)      # (route_id, stop_id) -> service_ids
         self.serves_dir = defaultdict(set)  # (route_id, direction_id, stop_id) -> service_ids
+        self.trip_counts = defaultdict(Counter)  # (route_id, stop_id) -> {service_id: trips}
         self.patterns = defaultdict(dict)   # (route_id, direction_id) -> {stop tuple: info}
         self.calendar = {}
         self.exceptions = defaultdict(dict)
@@ -141,6 +161,7 @@ class Gtfs:
         for s in set(stops):
             self.serves[(route, s)].add(service)
             self.serves_dir[(route, direction, s)].add(service)
+            self.trip_counts[(route, s)][service] += 1
         p = self.patterns[(route, direction)].get(stops)
         if p is None:
             p = self.patterns[(route, direction)][stops] = {"trips": 0, "services": set(), "headsigns": Counter()}
@@ -210,6 +231,17 @@ class Gtfs:
                 if sv & services:
                     return "yes"
         return "off_dates" if seen else "never"
+
+    def most_daily_trips(self, route, stop, first, last):
+        """The most trips of a route at a stop (or a station's platforms) on any one day from first to last."""
+        counts = Counter()
+        for s in self.members(stop):
+            counts.update(self.trip_counts.get((route, s), {}))
+        best, day = 0, first
+        while day <= last:
+            best = max(best, sum(n for service, n in counts.items() if self.active_on(service, day)))
+            day += dt.timedelta(days=1)
+        return best
 
     def stats(self):
         dates = [d for c in self.calendar.values() for d in c[1:] if d]
@@ -325,6 +357,25 @@ def load_alerts(path):
     return ts, [e for e in data.get("entity") or [] if _get(e, "alert")]
 
 
+def load_for_check(path):
+    """Alert entities to check from a GTFS-realtime feed, one entity, a bare alert,
+    or a draft written by `draft --out`."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return []
+    entity = data.get("entity")
+    if isinstance(entity, list):
+        return [e for e in entity if _get(e, "alert")]
+    if isinstance(entity, dict):
+        return [entity]
+    if _get(data, "alert"):
+        return [data]
+    if _get(data, "informed_entity") is not None:
+        return [{"id": "alert", "alert": data}]
+    return []
+
+
 def local_date(ts, tz_name=None):
     when = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
     if tz_name:
@@ -378,7 +429,10 @@ def _dedupe(issues):
 
 
 def _period(alert):
-    periods = _get(alert, "active_period") or []
+    """(start, end) of the alert. The schedule is checked when service is affected, so impact_period
+    (GTFS-realtime, June 2026) comes first, then active_period, then communication_period."""
+    periods = (_get(alert, "impact_period") or _get(alert, "active_period")
+               or _get(alert, "communication_period") or [])
     starts = [_int(_get(p, "start")) for p in periods]
     ends = [_int(_get(p, "end")) for p in periods]
     start = min(starts) if starts else 0
@@ -465,10 +519,13 @@ def check_alert(g, entity, feed_ts, tz=None):
         missing = sorted(p for p in made if p not in alert_pairs and p[0] not in route_level)
         by_stop = defaultdict(list)
         for r, s in missing:
-            by_stop[s].append(g.route_name(r))
+            by_stop[s].append(r)
         for s in sorted(by_stop):
+            routes = sorted(by_stop[s], key=lambda r: route_sort_key(g.route_name(r)))
+            # Routes with few trips at a stop (peak-only, school, early-morning) are the easiest to leave out.
             issues.append({"kind": "route_missing_at_stop", "stop_id": s, "stop": g.stop_label(s),
-                           "routes": sorted(by_stop[s], key=route_sort_key)})
+                           "routes": [g.route_name(r) for r in routes],
+                           "trips_a_day": [g.most_daily_trips(r, s, first, last) for r in routes]})
         closed = {m for s in tagged for m in g.members(s)} | {g.stops[s]["parent"] for s in tagged if g.stops[s]["parent"]}
         human = set()
         for n in all_nums:
@@ -523,7 +580,19 @@ def _span(start, end, tz):
     return "from %s until further notice" % _day(start, tz)
 
 
-def draft(g, stop_ids, start, end=None, cause="UNKNOWN_CAUSE", effect="NO_SERVICE", feed_ts=None, tz=None):
+def _day_es(ts, tz):
+    d = local_date(ts, tz)
+    return "%s %d de %s de %d" % (DAYS_ES[d.weekday()], d.day, MONTHS_ES[d.month - 1], d.year)
+
+
+def _span_es(start, end, tz):
+    if end:
+        return "desde el %s hasta el %s" % (_day_es(start, tz), _day_es(end, tz))
+    return "desde el %s hasta nuevo aviso" % _day_es(start, tz)
+
+
+def draft(g, stop_ids, start, end=None, cause="UNKNOWN_CAUSE", effect="NO_SERVICE", feed_ts=None, tz=None,
+          spanish=False):
     """Draft a stop-closure alert from the schedule: every route that stops at the
     given stops on those dates, and the nearest open stop before and after on each."""
     tz = tz or g.agency_tz
@@ -550,7 +619,7 @@ def draft(g, stop_ids, start, end=None, cause="UNKNOWN_CAUSE", effect="NO_SERVIC
             if key not in best or info["trips"] > best[key][1]["trips"]:
                 best[key] = (stops, info)
 
-    lines, alternates = [], []
+    lines, lines_es, alternates = [], [], []
     for route, direction in sorted(best, key=lambda k: (route_sort_key(g.route_name(k[0])), k[1])):
         stops, info = best[(route, direction)]
         headsign = info["headsigns"].most_common(1)[0][0]
@@ -564,21 +633,39 @@ def draft(g, stop_ids, start, end=None, cause="UNKNOWN_CAUSE", effect="NO_SERVIC
                 if x and x not in options:
                     options.append(x)
         alternates.extend(x for x in options if x not in alternates)
+        name = g.route_name(route)
         toward = (" toward %s" % headsign) if headsign else ""
         where = " or ".join(g.stop_label(x) for x in options) or "no open stop nearby on this route"
-        lines.append("Route %s%s: %s" % (g.route_name(route), toward, where))
+        lines.append("Route %s%s: %s" % (name, toward, where))
+        toward_es = (" hacia %s" % headsign) if headsign else ""
+        where_es = " o ".join(g.stop_label(x) for x in options) or "no hay otra parada abierta cerca en esta ruta"
+        lines_es.append("Ruta %s%s: %s" % (name, toward_es, where_es))
 
     names = sorted({g.route_name(r) for r, _ in pairs}, key=route_sort_key)
+    verb, verb_es, verb_es_plural = VERBS.get(effect, CLOSED)
     span = _span(start, end, tz)
     if len(requested) == 1:
-        head = "Stop %s closed %s" % (g.stop_label(requested[0]), span)
+        head = "Stop %s %s %s" % (g.stop_label(requested[0]), verb, span)
     else:
-        head = "%d stops closed on %s %s %s" % (len(requested), "Route" if len(names) == 1 else "Routes",
-                                                _join(names), span)
+        head = "%d stops %s on %s %s %s" % (len(requested), verb, "Route" if len(names) == 1 else "Routes",
+                                            _join(names), span)
     if CAUSE_WORDS.get(cause):
         head += " due to %s" % CAUSE_WORDS[cause]
     head += "."
     desc = "Affected routes:\n" + "\n".join(names) + "\n\nGet on/off at:\n" + "\n".join(lines)
+    head_es = desc_es = None
+    if spanish:
+        span_es = _span_es(start, end, tz)
+        if len(requested) == 1:
+            head_es = "Parada %s %s %s" % (g.stop_label(requested[0]), verb_es, span_es)
+        else:
+            head_es = "%d paradas %s en %s %s %s" % (len(requested), verb_es_plural,
+                                                    "la ruta" if len(names) == 1 else "las rutas",
+                                                    _join(names, "y"), span_es)
+        if CAUSE_WORDS_ES.get(cause):
+            head_es += " por %s" % CAUSE_WORDS_ES[cause]
+        head_es += "."
+        desc_es = "Rutas afectadas:\n" + "\n".join(names) + "\n\nSuba o baje en:\n" + "\n".join(lines_es)
 
     informed = []
     for route, sid in sorted(pairs, key=lambda p: (route_sort_key(g.route_name(p[0])), p[1])):
@@ -592,10 +679,21 @@ def draft(g, stop_ids, start, end=None, cause="UNKNOWN_CAUSE", effect="NO_SERVIC
     period = {"start": int(start)}
     if end:
         period["end"] = int(end)
-    entity = {"id": "draft-" + "-".join(requested), "alert": {
-        "active_period": [period], "informed_entity": informed, "cause": cause, "effect": effect,
-        "header_text": {"translation": [{"text": head, "language": "en"}]},
-        "description_text": {"translation": [{"text": desc, "language": "en"}]}}}
+    header_tr = [{"text": head, "language": "en"}]
+    desc_tr = [{"text": desc, "language": "en"}]
+    if spanish:
+        header_tr.append({"text": head_es, "language": "es"})
+        desc_tr.append({"text": desc_es, "language": "es"})
+    alert = {"active_period": [period], "informed_entity": informed, "cause": cause, "effect": effect,
+             "header_text": {"translation": header_tr}, "description_text": {"translation": desc_tr}}
+    # effect_detail as King County Metro's and the MBTA's feeds use it, so `check` reads a draft as stop-level.
+    detail = DETAILS.get(effect, "STOP_CLOSURE")
+    if detail:
+        alert["effect_detail"] = detail
+    review = "Draft for staff review. Check it against conditions in the field before publishing."
+    if spanish:
+        review += (" The Spanish text comes from a fixed template, with stop names and destinations as the "
+                   "schedule has them; have a qualified translator review it.")
     return {
         "stops": requested,
         "window": [first.isoformat(), last.isoformat()],
@@ -603,8 +701,10 @@ def draft(g, stop_ids, start, end=None, cause="UNKNOWN_CAUSE", effect="NO_SERVIC
         "alternates": alternates,
         "header": head,
         "description": desc,
-        "entity": entity,
-        "review": "Draft for staff review. Check it against conditions in the field before publishing.",
+        "header_es": head_es,
+        "description_es": desc_es,
+        "entity": {"id": "draft-" + "-".join(requested), "alert": alert},
+        "review": review,
     }
 
 
@@ -617,6 +717,8 @@ def audit(g, alerts, feed_ts, tz=None):
     stop_level = [r for r in records if r["stop_level"]]
     replays = [r["replay"] for r in records if r["replay"]]
     headers = [r["header_chars"] for r in records if r["header_chars"]]
+    missing_trips = [n for r in records for i in r["issues"] if i["kind"] == "route_missing_at_stop"
+                     for n in i.get("trips_a_day", [])]
     summary = {
         "alerts": len(records),
         "with_issue": sum(1 for r in records if r["issues"]),
@@ -629,6 +731,8 @@ def audit(g, alerts, feed_ts, tz=None):
         "stop_level_plain": sum(1 for r in stop_level if not r["at_station"]),
         "stop_level_plain_missing_routes": sum(1 for r in stop_level if not r["at_station"] and any(
             i["kind"] == "route_missing_at_stop" for i in r["issues"])),
+        "missing_route_pairs": len(missing_trips),
+        "missing_route_pairs_few_trips": sum(1 for n in missing_trips if n <= FEW_TRIPS),
         "replay": {k: sum(x[k] for x in replays) for k in ("alert_pairs", "drafted_pairs", "matched",
                                                           "missing_routes", "human_alternates",
                                                           "alternates_found")},
@@ -658,8 +762,16 @@ def issue_text(i):
     k = i["kind"]
     if k == "route_missing_at_stop":
         if len(i["routes"]) == 1:
-            return "Stop %s: route %s also stops here on these dates but is not tagged" % (i["stop"], i["routes"][0])
-        return "Stop %s: routes %s also stop here on these dates but are not tagged" % (i["stop"], _join(i["routes"]))
+            text = "Stop %s: route %s also stops here on these dates but is not tagged" % (i["stop"], i["routes"][0])
+        else:
+            text = "Stop %s: routes %s also stop here on these dates but are not tagged" % (i["stop"],
+                                                                                            _join(i["routes"]))
+        trips = i.get("trips_a_day") or []
+        if len(trips) == 1:
+            text += " (most trips in one day: %d)" % trips[0]
+        elif trips:
+            text += " (most trips in one day: %s)" % ", ".join("%s: %d" % rn for rn in zip(i["routes"], trips))
+        return text
     if k == "route_not_serving_stop":
         return "Route %s is tagged at stop %s but does not stop there %s" % (
             i["route"], i["stop"], "on these dates" if i["when"] == "off_dates" else "anywhere in the schedule")
@@ -693,6 +805,8 @@ def report_markdown(result):
         "stops there: %d" % (s["stop_level"], s["stop_level_missing_routes"]),
         "- Of these, at a plain stop rather than a station or its platforms: %d; missing at least one route: %d"
         % (s["stop_level_plain"], s["stop_level_plain_missing_routes"]),
+        "- Untagged route/stop pairs in those alerts: %d; of these, with at most %d trips a day at that stop: %d"
+        % (s["missing_route_pairs"], FEW_TRIPS, s["missing_route_pairs_few_trips"]),
         "- Alerts whose text lists routes but leaves out a tagged one: %d"
         % s["alerts_by_kind"].get("tagged_not_named", 0),
         "- Drafter replay on those alerts: it reproduced %d of the %d tagged route/stop pairs from the schedule "
@@ -737,7 +851,8 @@ def report_markdown(result):
         "- A tagged route is reported as left out of the text only when the text lists routes and the route's "
         "name appears nowhere in it.",
         "- Each alert is checked against the first %d days of its active period, or the days it ran if it has "
-        "ended. Routes are matched to stops through the schedule's trips, not through maps." % WINDOW_DAYS,
+        "ended. Routes are matched to stops through the schedule's trips, not through maps. Trips a day count "
+        "the whole day, not only the hours an alert is active." % WINDOW_DAYS,
         "- A detour of one route is not checked for missing routes, because other routes still serve those stops.",
         "",
         "Made by MV2 of Munim, Inc. with AI agents. Code Apache-2.0; this report CC BY 4.0. Source data: the "
@@ -778,12 +893,14 @@ def write_outputs(result, out_dir):
         f.write(replay_markdown(result))
     with open(os.path.join(out_dir, "findings.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(("alert_id", "effect", "effect_detail", "kind", "route", "stop_id", "stop", "when", "header"))
+        w.writerow(("alert_id", "effect", "effect_detail", "kind", "route", "stop_id", "stop", "when", "header",
+                    "trips_a_day"))
         for r in result["alerts"]:
             for i in r["issues"]:
                 w.writerow((r["id"], r["effect"], r["effect_detail"], i["kind"],
                             i.get("route") or "; ".join(i.get("routes", [])) or i.get("route_id", ""),
-                            i.get("stop_id", ""), i.get("stop", ""), i.get("when", ""), r["header"]))
+                            i.get("stop_id", ""), i.get("stop", ""), i.get("when", ""), r["header"],
+                            "; ".join(str(n) for n in i.get("trips_a_day", []))))
 
 
 # ---------------------------------------------------------------- command line
@@ -830,8 +947,16 @@ def main(argv=None):
     d.add_argument("--end", help="YYYY-MM-DD or epoch seconds; leave out for 'until further notice'")
     d.add_argument("--cause", default="UNKNOWN_CAUSE")
     d.add_argument("--effect", default="NO_SERVICE")
+    d.add_argument("--spanish", action="store_true", help="add a Spanish translation from a fixed template")
     d.add_argument("--tz")
     d.add_argument("--out", help="write the draft as JSON here")
+    c = sub.add_parser("check", help="check one alert or draft before publishing (exit code 1 if anything is found)")
+    c.add_argument("--gtfs", required=True)
+    c.add_argument("--alert", required=True,
+                   help="JSON: a GTFS-realtime feed or entity, a bare alert, or a draft from `draft --out`")
+    c.add_argument("--now", help="YYYY-MM-DD or epoch seconds (default: now)")
+    c.add_argument("--tz")
+    c.add_argument("--json", action="store_true", help="print the full result as JSON")
     args = ap.parse_args(argv)
 
     if args.cmd == "fetch":
@@ -857,14 +982,33 @@ def main(argv=None):
               % (s["alerts"], s["with_issue"], s["stop_level"], s["stop_level_missing_routes"],
                  json.dumps(result["gtfs"])))
         return 0
+    if args.cmd == "check":
+        alerts = load_for_check(args.alert)
+        if not alerts:
+            print("No alert found in %s" % args.alert)
+            return 2
+        now = parse_when(args.now) if args.now else int(time.time())
+        records = [check_alert(g, e, now, args.tz or g.agency_tz) for e in alerts]
+        if args.json:
+            print(json.dumps(records, indent=1, ensure_ascii=False))
+        else:
+            for r in records:
+                print("Alert %s: %s" % (r["id"] or "-", (r["header"] or "(no header)").replace("\n", " ")))
+                print("\n".join("  - " + issue_text(i) for i in r["issues"]) or "  No findings.")
+        return 1 if any(r["issues"] for r in records) else 0
     result = draft(g, [s.strip() for s in args.stops.split(",") if s.strip()], parse_when(args.start),
-                   parse_when(args.end), args.cause, args.effect, tz=args.tz)
+                   parse_when(args.end), args.cause, args.effect, tz=args.tz, spanish=args.spanish)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=1, ensure_ascii=False)
     print(result["header"])
     print()
     print(result["description"])
+    if args.spanish:
+        print()
+        print(result["header_es"])
+        print()
+        print(result["description_es"])
     return 0
 
 
