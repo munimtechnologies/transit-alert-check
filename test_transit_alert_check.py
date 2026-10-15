@@ -109,6 +109,39 @@ ALERTS = {
 }
 
 
+# A protobuf encoder for tests, written from gtfs-realtime.proto.
+def pb_varint(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def pb_field(number, value):
+    if isinstance(value, int):
+        return pb_varint(number << 3) + pb_varint(value)
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return pb_varint(number << 3 | 2) + pb_varint(len(value)) + value
+
+
+def pb_text(text, language="en"):
+    return pb_field(1, pb_field(1, text) + pb_field(2, language))
+
+
+PB_ALERT = (pb_field(1, pb_field(1, FEED) + pb_field(2, ts(2026, 12, 31)))
+            + pb_field(5, pb_field(1, "1") + pb_field(2, "R10") + pb_field(3, 3) + pb_field(5, "1002"))
+            + pb_field(6, 10) + pb_field(7, 1) + pb_field(10, pb_text("Stop #1002 closed"))
+            + pb_field(18, pb_text("STOP_CLOSURE"))
+            + pb_field(1001, "an extension")              # skipped
+            + pb_varint(9999 << 3 | 5) + b"\x00\x00\x00\x00")  # a fixed32 field, skipped
+PB_HEADER = pb_field(1, pb_field(1, "2.0") + pb_field(3, FEED))
+PB_FEED = (PB_HEADER + pb_field(2, pb_field(1, "P1") + pb_field(5, PB_ALERT))
+           + pb_field(2, pb_field(1, "TU") + pb_field(3, b"\x0a\x02T1")))
+
+
 def write_zip(path, files):
     with zipfile.ZipFile(path, "w") as zf:
         for name, text in files.items():
@@ -246,6 +279,50 @@ class TextTest(unittest.TestCase):
         self.assertEqual(tac.alert_window(0, None, FEED), (dt.date(2026, 10, 14), dt.date(2026, 10, 27)))
 
 
+class ProtobufTest(Fixture):
+    def test_decode(self):
+        d = tac.decode_pb(PB_FEED)
+        self.assertEqual(d["header"], {"gtfs_realtime_version": "2.0", "timestamp": FEED})
+        self.assertEqual(d["entity"][1], {"id": "TU"})
+        self.assertEqual(d["entity"][0], {"id": "P1", "alert": {
+            "active_period": [{"start": FEED, "end": ts(2026, 12, 31)}],
+            "informed_entity": [{"agency_id": "1", "route_id": "R10", "route_type": 3, "stop_id": "1002"}],
+            "cause": "CONSTRUCTION", "effect": "NO_SERVICE",
+            "header_text": {"translation": [{"text": "Stop #1002 closed", "language": "en"}]},
+            "effect_detail": {"translation": [{"text": "STOP_CLOSURE", "language": "en"}]}}})
+        # An enum value the table does not know stays a number; a field of the wrong type is skipped.
+        self.assertEqual(tac.decode_pb(pb_field(7, 99), "Alert"), {"effect": "99"})
+        self.assertEqual(tac.decode_pb(pb_field(1, 5), "Translation"), {})
+        self.assertEqual(tac.decode_pb(pb_field(6, 1) + pb_field(2, "R7"), "EntitySelector"),
+                         {"direction_id": 1, "route_id": "R7"})
+        self.assertEqual(pb_varint(300), b"\xac\x02")
+        self.assertEqual(tac._varint(b"\xac\x02", 0), (300, 2))
+
+    def test_read_feed_and_check(self):
+        path = os.path.join(self.tmp.name, "alerts.pb")
+        with open(path, "wb") as f:
+            f.write(PB_FEED)
+        feed_ts, alerts = tac.load_alerts(path)
+        self.assertEqual((feed_ts, [e["id"] for e in alerts]), (FEED, ["P1"]))
+        r = tac.check_alert(self.g, alerts[0], feed_ts)
+        self.assertTrue(r["stop_level"])
+        self.assertEqual(r["effect_detail"], "STOP_CLOSURE")
+        self.assertEqual(r["issues"], [{"kind": "route_missing_at_stop", "stop_id": "1002",
+                                        "stop": "#1002 1st Ave & Pike St", "routes": ["20"], "trips_a_day": [1]}])
+        self.assertEqual(r["replay"]["tagged_pairs"], [{"route": "10", "stop_id": "1002", "trips_a_day": 3}])
+        # JSON with a byte-order mark is still read as JSON; an empty file is an empty feed.
+        bom = os.path.join(self.tmp.name, "bom.json")
+        with open(bom, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(ALERTS).encode("utf-8"))
+        self.assertEqual(len(tac.load_alerts(bom)[1]), 7)
+        empty = os.path.join(self.tmp.name, "empty.pb")
+        open(empty, "wb").close()
+        self.assertEqual(tac.load_alerts(empty), (0, []))
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(tac.main(["check", "--gtfs", self.zip, "--alert", path, "--now", "2026-10-14"]), 1)
+        self.assertIn("route 20 also stops here", printed.getvalue())
+
+
 class DraftTest(Fixture):
     def test_single_stop(self):
         d = tac.draft(self.g, ["1002"], FEED, ts(2026, 12, 31), "CONSTRUCTION", feed_ts=FEED)
@@ -332,12 +409,22 @@ class AuditTest(Fixture):
         self.assertEqual((s["stop_level"], s["stop_level_missing_routes"]), (4, 4))
         self.assertEqual((s["stop_level_plain"], s["stop_level_plain_missing_routes"]), (3, 3))
         self.assertEqual((s["missing_route_pairs"], s["missing_route_pairs_few_trips"]), (5, 5))
+        self.assertEqual((s["tagged_route_pairs"], s["tagged_route_pairs_few_trips"]), (2, 2))
         self.assertEqual(s["replay"], {"alert_pairs": 3, "drafted_pairs": 7, "matched": 2, "missing_routes": 5,
                                        "human_alternates": 2, "alternates_found": 2})
         self.assertEqual((s["expired"], s["open_ended"], s["future"]), (1, 1, 2))
         self.assertEqual((s["with_translation"], s["with_tts"], s["unchecked"]), (1, 0, 0))
         self.assertEqual(s["other_agency_entities"], 1)
         self.assertEqual(s["long_headers"], 0)
+
+    def test_tagged_pairs(self):
+        self.assertEqual(self.by_id["E1"]["replay"]["tagged_pairs"],
+                         [{"route": "10", "stop_id": "1002", "trips_a_day": 3}])
+        self.assertEqual(self.by_id["E3"]["replay"]["tagged_pairs"], [])
+        self.assertEqual(self.by_id["E4"]["replay"]["tagged_pairs"], [])
+        self.assertEqual(self.by_id["E5"]["replay"]["tagged_pairs"],
+                         [{"route": "20", "stop_id": "9000", "trips_a_day": 1}])
+        self.assertIsNone(self.by_id["E2"]["replay"])
 
     def test_each_alert(self):
         self.assertEqual(self.by_id["E1"]["issues"], [
@@ -386,6 +473,8 @@ class AuditTest(Fixture):
                       "one route: 3", md)
         self.assertIn("- Untagged route/stop pairs in those alerts: 5; of these, with at most 4 trips a day at that "
                       "stop: 5", md)
+        self.assertIn("- Tagged route/stop pairs the schedule confirms in those alerts: 2; with at most 4 trips a "
+                      "day: 2", md)
         self.assertIn("with AI agents", md)
         rp = tac.replay_markdown(self.result)
         self.assertIn("## Alert E1 (NO_SERVICE / STOP_CLOSURE)", rp)

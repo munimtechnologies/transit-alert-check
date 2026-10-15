@@ -3,14 +3,15 @@
 against its own GTFS schedule, and draft stop-closure alerts from that schedule.
 
 A rider who looks up route 20 only sees an alert if the alert is tagged with
-route 20. This tool reads the agency's live alerts (GTFS-realtime as JSON) and
-its static GTFS, and lists, for every alert:
+route 20. This tool reads the agency's live alerts (GTFS-realtime, as protobuf
+or JSON) and its static GTFS, and lists, for every alert:
 
 - stop and route IDs that are not in the schedule;
 - tagged route/stop pairs where the route does not stop there on the alert's dates;
 - for stop closures, stop moves and accessibility alerts, routes that do stop
   there on those dates but are not tagged (their riders may not see the alert),
-  with the most trips each runs there in one day;
+  with the most trips each runs there in one day, and the same count for the
+  routes that are tagged, so the two can be compared;
 - route numbers named in the text but not tagged, and stop numbers in the text
   that are not tagged or not in the schedule;
 - tagged routes that the text leaves out when it lists the affected routes
@@ -42,7 +43,7 @@ import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 REPO_URL = "https://github.com/munimtechnologies/transit-alert-check"
 USER_AGENT = "transit-alert-check/%s (+%s)" % (__version__, REPO_URL)
@@ -320,6 +321,98 @@ def load_gtfs(path):
     return g
 
 
+# ---------------------------------------------------------------- GTFS-realtime protobuf
+
+# The alert parts of gtfs-realtime.proto (google/transit, Apache-2.0), decoded with the
+# standard library: field number -> (name, kind, repeated). A kind is a message name,
+# "str", "int", or an enum. Trip updates, vehicle positions and extensions are skipped.
+CAUSES = ("", "UNKNOWN_CAUSE", "OTHER_CAUSE", "TECHNICAL_PROBLEM", "STRIKE", "DEMONSTRATION", "ACCIDENT",
+          "HOLIDAY", "WEATHER", "MAINTENANCE", "CONSTRUCTION", "POLICE_ACTIVITY", "MEDICAL_EMERGENCY",
+          "SPECIAL_EVENT")
+EFFECTS = ("", "NO_SERVICE", "REDUCED_SERVICE", "SIGNIFICANT_DELAYS", "DETOUR", "ADDITIONAL_SERVICE",
+           "MODIFIED_SERVICE", "OTHER_EFFECT", "UNKNOWN_EFFECT", "STOP_MOVED", "NO_EFFECT", "ACCESSIBILITY_ISSUE")
+ENUMS = {"cause": CAUSES, "effect": EFFECTS}
+_TEXT = "TranslatedString"
+PROTO = {
+    "FeedMessage": {1: ("header", "FeedHeader", False), 2: ("entity", "FeedEntity", True)},
+    "FeedHeader": {1: ("gtfs_realtime_version", "str", False), 3: ("timestamp", "int", False)},
+    "FeedEntity": {1: ("id", "str", False), 2: ("is_deleted", "int", False), 5: ("alert", "Alert", False)},
+    "Alert": {1: ("active_period", "TimeRange", True), 2: ("communication_period", "TimeRange", True),
+              3: ("impact_period", "TimeRange", True), 5: ("informed_entity", "EntitySelector", True),
+              6: ("cause", "cause", False), 7: ("effect", "effect", False), 10: ("header_text", _TEXT, False),
+              11: ("description_text", _TEXT, False), 12: ("tts_header_text", _TEXT, False),
+              13: ("tts_description_text", _TEXT, False), 17: ("cause_detail", _TEXT, False),
+              18: ("effect_detail", _TEXT, False)},
+    "TimeRange": {1: ("start", "int", False), 2: ("end", "int", False)},
+    "EntitySelector": {1: ("agency_id", "str", False), 2: ("route_id", "str", False), 3: ("route_type", "int", False),
+                       4: ("trip", "TripDescriptor", False), 5: ("stop_id", "str", False),
+                       6: ("direction_id", "int", False)},
+    "TripDescriptor": {1: ("trip_id", "str", False), 5: ("route_id", "str", False), 6: ("direction_id", "int", False)},
+    _TEXT: {1: ("translation", "Translation", True)},
+    "Translation": {1: ("text", "str", False), 2: ("language", "str", False)},
+}
+
+
+def _varint(buf, i):
+    shift = value = 0
+    while True:
+        b = buf[i]
+        i += 1
+        value |= (b & 0x7F) << shift
+        if b < 0x80:
+            return value, i
+        shift += 7
+
+
+def decode_pb(buf, message="FeedMessage"):
+    """A GTFS-realtime protobuf message as the same dict its JSON form gives (enums as names)."""
+    fields, out, i = PROTO[message], {}, 0
+    while i < len(buf):
+        key, i = _varint(buf, i)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = _varint(buf, i)
+        elif wire == 2:
+            n, i = _varint(buf, i)
+            value, i = buf[i:i + n], i + n
+        elif wire in (1, 5):
+            value, i = None, i + (8 if wire == 1 else 4)
+        else:
+            raise ValueError("unsupported protobuf wire type %d in %s" % (wire, message))
+        if number not in fields or value is None:
+            continue
+        name, kind, repeated = fields[number]
+        if (wire == 0) != (kind == "int" or kind in ENUMS):
+            continue  # not the type the schema expects
+        if kind == "str":
+            value = bytes(value).decode("utf-8", "replace")
+        elif kind in ENUMS:
+            value = ENUMS[kind][value] if 0 < value < len(ENUMS[kind]) else str(value)
+        elif kind != "int":
+            value = decode_pb(value, kind)
+        if repeated:
+            out.setdefault(name, []).append(value)
+        else:
+            out[name] = value
+    return out
+
+
+def read_feed(path):
+    """A GTFS-realtime feed (or a single alert) as a dict, from JSON or from protobuf."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    # A protobuf feed starts with 0x0A (a newline), so JSON is tried first and protobuf if it fails.
+    if raw.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] in (b"{", b"[", b""):
+        try:
+            return json.loads(raw.decode("utf-8-sig").strip() or "{}")
+        except ValueError:
+            pass
+    try:
+        return decode_pb(raw)
+    except IndexError:
+        raise ValueError("%s is neither JSON nor a complete GTFS-realtime protobuf" % path)
+
+
 # ---------------------------------------------------------------- alerts
 
 def _get(d, key):
@@ -349,19 +442,19 @@ def _plain(value):
 
 
 def load_alerts(path):
-    """(feed timestamp, alert entities) from GTFS-realtime JSON."""
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    """(feed timestamp, alert entities) from a GTFS-realtime feed in JSON or protobuf."""
+    data = read_feed(path)
+    if not isinstance(data, dict):
+        return 0, []
     header = data.get("header") or {}
     ts = _int(header.get("timestamp"))
-    return ts, [e for e in data.get("entity") or [] if _get(e, "alert")]
+    return ts, [e for e in data.get("entity") or [] if _get(e, "alert") and not _get(e, "is_deleted")]
 
 
 def load_for_check(path):
     """Alert entities to check from a GTFS-realtime feed, one entity, a bare alert,
     or a draft written by `draft --out`."""
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    data = read_feed(path)
     if not isinstance(data, dict):
         return []
     entity = data.get("entity")
@@ -534,7 +627,11 @@ def check_alert(g, entity, feed_ts, tz=None):
                 human.add(sid)
         replay = {"alert_pairs": len(alert_pairs), "drafted_pairs": len(made), "matched": len(alert_pairs & made),
                   "missing_routes": len(missing), "human_alternates": len(human),
-                  "alternates_found": len(human & set(drafted["alternates"]))}
+                  "alternates_found": len(human & set(drafted["alternates"])),
+                  # The same trip count for the tagged routes the schedule confirms, to compare with missing ones.
+                  "tagged_pairs": [{"route": g.route_name(r), "stop_id": s,
+                                    "trips_a_day": g.most_daily_trips(r, s, first, last)}
+                                   for r, s in sorted(alert_pairs & made)]}
 
     return {
         "id": str(_get(entity, "id") or ""),
@@ -719,6 +816,7 @@ def audit(g, alerts, feed_ts, tz=None):
     headers = [r["header_chars"] for r in records if r["header_chars"]]
     missing_trips = [n for r in records for i in r["issues"] if i["kind"] == "route_missing_at_stop"
                      for n in i.get("trips_a_day", [])]
+    tagged_trips = [p["trips_a_day"] for x in replays for p in x.get("tagged_pairs", [])]
     summary = {
         "alerts": len(records),
         "with_issue": sum(1 for r in records if r["issues"]),
@@ -733,6 +831,8 @@ def audit(g, alerts, feed_ts, tz=None):
             i["kind"] == "route_missing_at_stop" for i in r["issues"])),
         "missing_route_pairs": len(missing_trips),
         "missing_route_pairs_few_trips": sum(1 for n in missing_trips if n <= FEW_TRIPS),
+        "tagged_route_pairs": len(tagged_trips),
+        "tagged_route_pairs_few_trips": sum(1 for n in tagged_trips if n <= FEW_TRIPS),
         "replay": {k: sum(x[k] for x in replays) for k in ("alert_pairs", "drafted_pairs", "matched",
                                                           "missing_routes", "human_alternates",
                                                           "alternates_found")},
@@ -807,6 +907,8 @@ def report_markdown(result):
         % (s["stop_level_plain"], s["stop_level_plain_missing_routes"]),
         "- Untagged route/stop pairs in those alerts: %d; of these, with at most %d trips a day at that stop: %d"
         % (s["missing_route_pairs"], FEW_TRIPS, s["missing_route_pairs_few_trips"]),
+        "- Tagged route/stop pairs the schedule confirms in those alerts: %d; with at most %d trips a day: %d"
+        % (s["tagged_route_pairs"], FEW_TRIPS, s["tagged_route_pairs_few_trips"]),
         "- Alerts whose text lists routes but leaves out a tagged one: %d"
         % s["alerts_by_kind"].get("tagged_not_named", 0),
         "- Drafter replay on those alerts: it reproduced %d of the %d tagged route/stop pairs from the schedule "
@@ -937,7 +1039,7 @@ def main(argv=None):
     f.add_argument("--alerts", default="alerts.json")
     a = sub.add_parser("audit", help="check every alert in the feed")
     a.add_argument("--gtfs", required=True)
-    a.add_argument("--alerts", required=True)
+    a.add_argument("--alerts", required=True, help="GTFS-realtime alerts feed, protobuf or JSON")
     a.add_argument("--out", default="audit")
     a.add_argument("--tz", help="time zone for dates (default: the agency's)")
     d = sub.add_parser("draft", help="draft a stop-closure alert")
@@ -953,7 +1055,8 @@ def main(argv=None):
     c = sub.add_parser("check", help="check one alert or draft before publishing (exit code 1 if anything is found)")
     c.add_argument("--gtfs", required=True)
     c.add_argument("--alert", required=True,
-                   help="JSON: a GTFS-realtime feed or entity, a bare alert, or a draft from `draft --out`")
+                   help="JSON: a GTFS-realtime feed or entity, a bare alert, or a draft from `draft --out`; "
+                        "or a feed as protobuf")
     c.add_argument("--now", help="YYYY-MM-DD or epoch seconds (default: now)")
     c.add_argument("--tz")
     c.add_argument("--json", action="store_true", help="print the full result as JSON")
